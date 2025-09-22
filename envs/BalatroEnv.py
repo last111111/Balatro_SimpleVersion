@@ -47,10 +47,13 @@ class BalatroEnv(gym.Env):
         self.hand_basic_score = {**self.basic_score, **(hand_basic_score or {})}
         self.hand = []
         self.deck = {}
+        self.played_cards = []
+        self.discarded_cards = []
         self.max_play = max_play
         self.play_count = self.max_play
         self.max_discard = max_discard
         self.discard_count = self.max_discard
+        self.step_history = []
         obs_dim = 52 + 52 + 1 + 1
         self.observation_space = spaces.Box(0.0, 1.0, shape=(obs_dim,), dtype=np.float32)
 
@@ -58,41 +61,46 @@ class BalatroEnv(gym.Env):
         # 1) 生成并洗牌
         self.deck = self._init_deck()
         self.hand = []  
+        self.played_cards = []
+        self.discarded_cards = []
         self.play_count = self.max_play
         self.discard_count = self.max_discard
+        self.step_history = []
         # 2) 发手牌
         self.draw_card()
         return self._get_observation()
     
     def step(self, action):
+        # 保存step前的状态
+        prev_obs = self._get_observation()
+        prev_env_state = self.get_env_state()
+        
         # action 是一个 tuple: (action_type, mask)
         a_type = action[0]    # Head 1: 0 或 1
         mask   = action[1]    # Head 2: array([0,1,0,1,0,0,0], dtype=int8)
         reward = 0
-        '''
-        if a_type == 0:
-            old_score, _ = self.best_hand_score()
-        else:
-            old_score = 0
-        '''
+        
+        # 获取被选中的牌
+        selected_cards = [
+            self.hand[i] 
+            for i, m in enumerate(mask) 
+            if m and i < len(self.hand)
+        ]
+        
         if a_type == 0:   # 弃牌
             if self.discard_count > 0:
+                self.discarded_cards.extend(selected_cards)
                 self.update_hand(mask)
                 self.draw_card()
                 self.discard_count -= 1
-            # —— 新增：弃牌后的最优潜力分 —— 
-            #new_score, _ = self.best_hand_score()
-            # reward 设为分差
-            #reward = new_score - old_score
-            #self.update_hand(mask)
-            #self.draw_card()
-
         else:             # 出牌
             # 从手牌移到公共区
             reward = self.best_mask_score(mask)
+            self.played_cards.extend(selected_cards)
             self.update_hand(mask)
             self.draw_card()
             self.play_count -= 1
+            
         obs = self._get_observation()
         no_play_left = (self.play_count <= 0)
         no_discard_left = (self.discard_count <= 0)
@@ -102,6 +110,20 @@ class BalatroEnv(gym.Env):
         no_cards = no_hand and no_deck
         # done 为真当且仅当——出牌次数用尽 或者 弃牌次数用尽 或者 （手牌和牌库同时空）
         done = no_play_left or (no_discard_left and no_play_left) or no_cards
+        
+        # 保存(s,a)和环境信息
+        step_info = {
+            'state': prev_obs,
+            'action': action,
+            'reward': reward,
+            'next_state': obs,
+            'done': done,
+            'env_state': prev_env_state,
+            'selected_cards': selected_cards,
+            'action_type': 'discard' if a_type == 0 else 'play'
+        }
+        self.step_history.append(step_info)
+        
         return obs, reward, done, {}
 
     def seed(self, seed=None):
@@ -293,11 +315,54 @@ class BalatroEnv(gym.Env):
         # 拼成一个向量返回
         return np.concatenate([hand_mask, deck_mask, play_feat, discard_feat])
     
+    def get_env_state(self):
+        """获取完整的环境状态信息"""
+        return {
+            'hand': self.hand.copy(),
+            'played_cards': self.played_cards.copy(),
+            'discarded_cards': self.discarded_cards.copy(),
+            'deck': self.deck.copy(),
+            'play_count': self.play_count,
+            'discard_count': self.discard_count,
+            'max_play': self.max_play,
+            'max_discard': self.max_discard
+        }
+    
+    def get_step_history(self):
+        """获取所有step的历史记录"""
+        return self.step_history.copy()
+    
+    def save_episode_data(self, filepath=None):
+        """保存一局游戏的所有(s,a)数据和环境信息"""
+        import json
+        if filepath is None:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = f"episode_data_{timestamp}.json"
+        
+        episode_data = {
+            'step_history': self.step_history,
+            'final_env_state': self.get_env_state(),
+            'total_steps': len(self.step_history)
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(episode_data, f, indent=2, ensure_ascii=False)
+        
+        return filepath
+    
+    def clear_history(self):
+        """清空历史记录"""
+        self.step_history = []
+    
     def print_self(self):
         print("手牌:", self.hand)
+        print("已打出的牌:", self.played_cards)
+        print("已弃掉的牌:", self.discarded_cards)
         print("剩余牌:", self.deck)
         print(f"剩余出牌次数: {self.play_count}")
         print(f"剩余弃牌次数: {self.discard_count}")
+        print(f"已记录步数: {len(self.step_history)}")
         
 # 测试多头决策动作空间
 if __name__ == "__main__":
