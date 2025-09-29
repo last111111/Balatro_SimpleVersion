@@ -95,13 +95,22 @@ class BalatroEnv(gym.Env):
         selected_cards = [self.hand[i] for i, m in enumerate(mask) if m and i < len(self.hand)]
 
         reward = 0.0
-        if a_type == 0:   # 弃牌
+        if a_type == 0:  # 弃牌
+
             if self.discard_count > 0 and selected_cards:
+                old_score, _ = self.best_hand_score()     # 弃牌前潜力
                 self.discarded_cards.extend(selected_cards)
                 self.update_hand(mask)
                 self.draw_card()
                 self.discard_count -= 1
-            # 无次数或未选牌 → 无操作
+                new_score, _ = self.best_hand_score()     # 弃牌后潜力
+                delta = float(new_score - old_score)
+                if delta <=0:
+                    reward =0
+                else:
+                # 固定缩放常数（按你现在的分数量级很稳）
+                   reward = self.shaping_beta * delta
+
         else:             # 出牌
             reward = float(self.best_mask_score(mask)) if selected_cards else 0.0
             self.played_cards.extend(selected_cards)

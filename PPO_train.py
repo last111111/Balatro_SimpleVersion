@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 from envs.BalatroEnv import BalatroEnv
+
+
 def smooth_curve(y, window=100):
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0: return y
@@ -17,14 +19,18 @@ def smooth_curve(y, window=100):
     kernel = np.ones(w, dtype=np.float32) / w
     return np.convolve(y, kernel, mode='valid')
 
+
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def set_seed(seed: int):
     import random
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
+
+# ================== 模型：分离的出/弃 mask 头 ==================
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int, max_hand_size: int, hidden=(512, 512)):
         super().__init__()
@@ -34,16 +40,26 @@ class ActorCritic(nn.Module):
             layers += [nn.Linear(last, h), nn.ReLU()]
             last = h
         self.backbone = nn.Sequential(*layers)
-        self.logits_type   = nn.Linear(last, 2)                # 0=弃, 1=出
-        self.logits_select = nn.Linear(last, max_hand_size)    # hand mask (Bernoulli)
-        self.value_head    = nn.Linear(last, 1)
+
+        self.logits_type     = nn.Linear(last, 2)                 # 0=弃, 1=出
+        self.logits_sel_play = nn.Linear(last, max_hand_size)     # 出牌 mask 头
+        self.logits_sel_dis  = nn.Linear(last, max_hand_size)     # 弃牌 mask 头
+        self.value_head      = nn.Linear(last, 1)
+
         nn.init.zeros_(self.logits_type.bias)
-        nn.init.zeros_(self.logits_select.bias)
+        nn.init.zeros_(self.logits_sel_play.bias)
+        nn.init.zeros_(self.logits_sel_dis.bias)
         nn.init.zeros_(self.value_head.bias)
 
     def forward(self, x):
         z = self.backbone(x)
-        return self.logits_type(z), self.logits_select(z), self.value_head(z).squeeze(-1)
+        return (
+            self.logits_type(z),
+            self.logits_sel_play(z),
+            self.logits_sel_dis(z),
+            self.value_head(z).squeeze(-1)
+        )
+
 
 class PPOAgent:
     def __init__(self, obs_dim, max_hand_size, device,
@@ -54,61 +70,103 @@ class PPOAgent:
         self.clip, self.vcoef, self.ecoef = clip, vcoef, ecoef
         self.epochs, self.mb_size = epochs, mb_size
         self.max_hand_size = max_hand_size
+
         self.net = ActorCritic(obs_dim, max_hand_size).to(device)
         self.opt = optim.Adam(self.net.parameters(), lr=lr)
 
+        # 弃牌 mask 的损失系数（会在训练中渐增）
+        self.coef_sel_dis = 0.0
+        self.coef_sel_dis_target = 0.10
+
     @torch.no_grad()
     def act(self, obs_np):
+        """
+        采样策略：
+          - 先采类型头 type(0/1)
+          - 再根据类型选择对应的 mask 头（出=logits_sel_play / 弃=logits_sel_dis）
+          - 返回：a_type, a_mask, logp_type, logp_mask, value, entropy_total
+        """
         self.net.eval()
         x = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits_type, logits_sel, value = self.net(x)
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        a_type = dist_type.sample()  # (1,)
+        logits_type, logits_sel_play, logits_sel_dis, value = self.net(x)
 
-        hand_count = int(np.clip(np.round(obs_np[:52].sum()), 0, self.max_hand_size))
-        if hand_count == 0:
+        # 类型分布
+        dist_type = torch.distributions.Categorical(logits=logits_type)
+        a_type_t  = dist_type.sample()    # tensor 0/1
+        a_type    = int(a_type_t.item())
+
+        # 当前手牌数（依据 obs 前 52 维手牌 one-hot）
+        hand_count = int(np.clip(np.round(float(np.asarray(obs_np[:52]).sum())),
+                                 0, self.max_hand_size))
+
+        if hand_count <= 0:
             a_mask = torch.zeros((1, self.max_hand_size), dtype=torch.int64, device=self.device)
-            logprob_sel = torch.zeros((1,), device=self.device)
-            entropy_sel = torch.zeros((1,), device=self.device)
+            logprob_mask = torch.zeros((1,), device=self.device)
+            entropy_mask = torch.zeros((1,), device=self.device)
         else:
-            logits_valid = logits_sel[:, :hand_count]
-            dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
-            sampled = dist_bern.sample()
-            if sampled.sum() < 1:
+            # 选择对应的 mask 头
+            logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
+            logits_valid  = logits_active[:, :hand_count]
+            dist_bern     = torch.distributions.Bernoulli(logits=logits_valid)
+            sampled       = dist_bern.sample()  # (1,k)
+
+            # 出牌时，至少 1 张
+            if a_type == 1 and sampled.sum() < 1:
                 idx = torch.argmax(logits_valid, dim=1)
                 sampled[0, idx] = 1.0
-            pad = torch.zeros((1, self.max_hand_size - hand_count), device=self.device)
-            a_mask = torch.cat([sampled, pad], dim=1).to(torch.int64)
-            logprob_sel = dist_bern.log_prob(sampled).sum(dim=1)
-            entropy_sel = dist_bern.entropy().sum(dim=1)
 
-        logprob_type = dist_type.log_prob(a_type)
-        entropy_type = dist_type.entropy()
-        total_logprob = (logprob_type + logprob_sel).squeeze(0)
-        total_entropy = (entropy_type + entropy_sel).squeeze(0)
+            pad = torch.zeros((1, self.max_hand_size - hand_count), device=self.device)
+            a_mask_t = torch.cat([sampled, pad], dim=1).to(torch.int64)
+
+            a_mask = a_mask_t.squeeze(0).detach().cpu().tolist()
+            logprob_mask = dist_bern.log_prob(sampled).sum(dim=1)   # (1,)
+            entropy_mask = dist_bern.entropy().sum(dim=1)           # (1,)
+
+        logprob_type = dist_type.log_prob(a_type_t)   # (1,)
+        entropy_type = dist_type.entropy()            # (1,)
+
+        total_entropy = entropy_type + entropy_mask
         value = value.squeeze(0)
 
-        return int(a_type.item()), a_mask.squeeze(0).detach().cpu().numpy().tolist(), \
-               float(total_logprob.item()), float(value.item()), float(total_entropy.item())
+        return (
+            a_type,
+            a_mask,
+            float(logprob_type.item()),
+            float(logprob_mask.item()),
+            float(value.item()),
+            float(total_entropy.item())
+        )
 
     def evaluate_actions(self, obs_b, a_type_b, a_mask_b):
-        logits_type, logits_sel, values = self.net(obs_b)
+        """
+        训练时，对一个 batch 评估：
+          - 类型头 logp / 熵
+          - 按 a_type 每样本选择出/弃对应 mask 头，算 logp_mask / 熵
+          - 价值头 v
+        """
+        logits_type, logits_sel_play, logits_sel_dis, values = self.net(obs_b)
         dist_type = torch.distributions.Categorical(logits=logits_type)
-        logprob_type = dist_type.log_prob(a_type_b)
-        entropy_type = dist_type.entropy()
+        logprob_type = dist_type.log_prob(a_type_b)    # (B,)
+        entropy_type = dist_type.entropy()             # (B,)
 
         B = obs_b.size(0)
-        logprob_sel = torch.zeros(B, device=self.device)
-        entropy_sel = torch.zeros(B, device=self.device)
+        logprob_mask = torch.zeros(B, device=self.device)
+        entropy_mask = torch.zeros(B, device=self.device)
+
         for i in range(B):
+            # 有效位只在当前手牌数上
             k = int(torch.clamp(torch.round(obs_b[i, :52].sum()), 0, self.max_hand_size).item())
             if k > 0:
-                dist_bern = torch.distributions.Bernoulli(logits=logits_sel[i, :k])
-                a_mask_i = a_mask_b[i, :k].float()
-                logprob_sel[i] = dist_bern.log_prob(a_mask_i).sum()
-                entropy_sel[i] = dist_bern.entropy().sum()
+                if a_type_b[i].item() == 1:
+                    logits_valid = logits_sel_play[i, :k]
+                else:
+                    logits_valid = logits_sel_dis[i, :k]
+                dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
+                a_mask_i  = a_mask_b[i, :k].float()
+                logprob_mask[i] = dist_bern.log_prob(a_mask_i).sum()
+                entropy_mask[i] = dist_bern.entropy().sum()
 
-        return logprob_type + logprob_sel, values, entropy_type + entropy_sel
+        return logprob_type, logprob_mask, values, entropy_type, entropy_mask
 
     @staticmethod
     def gae(rews, dones, vals, gamma, lam):
@@ -125,20 +183,28 @@ class PPOAgent:
         return rets, adv
 
     def update(self, traj):
-        obs = torch.as_tensor(np.array(traj["obs"]), dtype=torch.float32, device=self.device)
-        a_type = torch.as_tensor(np.array(traj["a_type"]), dtype=torch.long, device=self.device)
-        a_mask = torch.as_tensor(np.array(traj["a_mask"]), dtype=torch.long, device=self.device)
+        obs   = torch.as_tensor(np.array(traj["obs"]), dtype=torch.float32, device=self.device)
+        a_type= torch.as_tensor(np.array(traj["a_type"]), dtype=torch.long, device=self.device)
+        a_mask= torch.as_tensor(np.array(traj["a_mask"]), dtype=torch.long, device=self.device)
 
         with torch.no_grad():
-            old_logp = torch.as_tensor(np.array(traj["logp"]), dtype=torch.float32, device=self.device)
-            values = torch.as_tensor(np.array(traj["val"]), dtype=torch.float32, device=self.device)
-            rewards = np.array(traj["rew"], dtype=np.float32)
-            dones = np.array(traj["done"], dtype=np.float32)
+            old_logp_type = torch.as_tensor(np.array(traj["logp_type"]), dtype=torch.float32, device=self.device)
+            old_logp_mask = torch.as_tensor(np.array(traj["logp_mask"]), dtype=torch.float32, device=self.device)
+            values   = torch.as_tensor(np.array(traj["val"]),  dtype=torch.float32, device=self.device)
+            rewards  = np.array(traj["rew"],  dtype=np.float32)
+            dones    = np.array(traj["done"], dtype=np.float32)
+
+            # --- GAE ---
             vals_ext = np.concatenate([values.detach().cpu().numpy(), np.array([0.0], dtype=np.float32)], 0)
             rets, adv = self.gae(rewards, dones, vals_ext, self.gamma, self.lmbda)
-            returns = torch.as_tensor(rets, dtype=torch.float32, device=self.device)
-            advantages = torch.as_tensor(adv, dtype=torch.float32, device=self.device)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            returns    = torch.as_tensor(rets, dtype=torch.float32, device=self.device)
+            advantages = torch.as_tensor(adv,  dtype=torch.float32, device=self.device)
+
+            # 标准化（避免尺度失衡），轻度裁剪优势
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+            returns    = (returns    - returns.mean())    / (returns.std(unbiased=False)    + 1e-8)
+            advantages.clamp_(-10.0, 10.0)
 
         N = obs.size(0)
         idx = np.arange(N)
@@ -147,20 +213,66 @@ class PPOAgent:
             for s in range(0, N, self.mb_size):
                 mb = idx[s:s + self.mb_size]
                 mb_obs, mb_type, mb_mask = obs[mb], a_type[mb], a_mask[mb]
-                mb_old_logp = old_logp[mb]
-                mb_ret, mb_adv = returns[mb], advantages[mb]
+                mb_old_logp_type = old_logp_type[mb]
+                mb_old_logp_mask = old_logp_mask[mb]
+                mb_ret, mb_adv   = returns[mb], advantages[mb]
+                mb_old_v         = values[mb].detach()
 
-                new_logp, new_v, ent = self.evaluate_actions(mb_obs, mb_type, mb_mask)
-                ratio = torch.exp(new_logp - mb_old_logp)
-                pol_loss = torch.max(-ratio * mb_adv,
-                                     -torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * mb_adv).mean()
-                v_loss = (mb_ret - new_v).pow(2).mean()
-                loss = pol_loss + self.vcoef * v_loss - self.ecoef * ent.mean()
+                new_logp_type, new_logp_mask, new_v, ent_type, ent_mask = self.evaluate_actions(
+                    mb_obs, mb_type, mb_mask
+                )
+
+                # ---- 策略损失：类型头 ----
+                ratio_type   = torch.exp(new_logp_type - mb_old_logp_type)
+                unclipped_t  = -ratio_type * mb_adv
+                clipped_t    = -torch.clamp(ratio_type, 1 - self.clip, 1 + self.clip) * mb_adv
+                pol_loss_type= torch.max(unclipped_t, clipped_t).mean()
+
+                # ---- 策略损失：mask 头（分开计算 play 与 discard）----
+                ratio_mask   = torch.exp(new_logp_mask - mb_old_logp_mask)
+                unclipped_m  = -ratio_mask * mb_adv
+                clipped_m    = -torch.clamp(ratio_mask, 1 - self.clip, 1 + self.clip) * mb_adv
+                per_sample_m = torch.max(unclipped_m, clipped_m)
+
+                m_play = (mb_type == 1)
+                m_dis  = (mb_type == 0)
+
+                # 避免除 0：当某类样本在这个 batch 中不存在，将对应均值设为 0
+                if m_play.any():
+                    pol_loss_mask_play = per_sample_m[m_play].mean()
+                else:
+                    pol_loss_mask_play = torch.tensor(0.0, device=self.device)
+
+                if m_dis.any():
+                    pol_loss_mask_dis  = per_sample_m[m_dis].mean()
+                else:
+                    pol_loss_mask_dis  = torch.tensor(0.0, device=self.device)
+
+                # 合并：出牌 mask 权重=1.0；弃牌 mask 逐步增至 0.1
+                coef_sel_play = 1.0
+                coef_sel_dis  = self.coef_sel_dis
+                pol_loss = pol_loss_type \
+                           + coef_sel_play * pol_loss_mask_play \
+                           + coef_sel_dis  * pol_loss_mask_dis
+
+                # ---- 值函数裁剪（PPO-style）----
+                vclip = 0.2
+                v_clipped = mb_old_v + torch.clamp(new_v - mb_old_v, -vclip, vclip)
+                v_loss = torch.max((new_v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
+
+                # ---- 熵（类型 + 小权重的mask 熵）----
+                ent = ent_type.mean() + 0.01 * ent_mask.mean()
+
+                loss = pol_loss + self.vcoef * v_loss - self.ecoef * ent
+                if not torch.isfinite(loss):
+                    self.opt.zero_grad()
+                    continue
 
                 self.opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 self.opt.step()
+
 
 def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
           gamma=0.99, gae_lambda=0.95, clip=0.2, vcoef=0.5,
@@ -169,14 +281,12 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
           save_path="ppo_balatro.pt", plot_path="training_curve.png",
           # Env 超参
           max_hand_size=8, max_play=5,
-          # 仅保留 shaping_beta
           shaping_beta=1.0):
 
     set_seed(seed)
     device = get_device()
     print(f"[Init] device={device}, seed={seed}, total_steps={total_steps}, update_steps={update_steps}")
 
-    # 只传 shaping_beta
     env = BalatroEnv(
         max_hand_size=max_hand_size,
         max_play=max_play,
@@ -188,15 +298,22 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
     agent = PPOAgent(obs_dim, max_hand_size, device, lr, gamma, gae_lambda, clip,
                      vcoef, ecoef_start, epochs, mb_size)
 
+    # 总更新次数，用于退火
     total_updates = int(math.ceil(total_steps / float(update_steps)))
     updates_done = 0
+
+    # 熵系数退火
     def anneal_ecoef():
         frac = min(1.0, updates_done / max(1, total_updates))
         return float(ecoef_start + (ecoef_end - ecoef_start) * frac)
 
-    # 两条曲线：
-    #   - train_return：用于训练的真实回报（包含弃牌塑形）
-    #   - plot_return ：仅统计“出牌动作”的reward（用于画图）
+    # 弃牌 mask 系数退火（建议 20% 更新内线性拉到 0.1）
+    def anneal_coef_dis():
+        warmup_frac = 0.2
+        frac = min(1.0, updates_done / max(1, int(total_updates * warmup_frac)))
+        return float(agent.coef_sel_dis_target * frac)
+
+    # 统计：训练真实回报（含弃牌塑形）vs 仅统计出牌回报（画图）
     ep_returns_train, ep_ret_train = [], 0.0
     ep_returns_plot,  ep_ret_plot  = [], 0.0
 
@@ -205,24 +322,27 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
 
     try:
         while total_collected < total_steps:
-            traj = {"obs": [], "a_type": [], "a_mask": [], "logp": [], "val": [], "rew": [], "done": []}
+            traj = {"obs": [], "a_type": [], "a_mask": [],
+                    "logp_type": [], "logp_mask": [],
+                    "val": [], "rew": [], "done": []}
             steps = 0
             while steps < update_steps and total_collected < total_steps:
-                a_type, a_mask, logp, val, _ = agent.act(obs)
+                a_type, a_mask, logp_type, logp_mask, val, _ = agent.act(obs)
                 next_obs, reward, done, _ = env.step((a_type, a_mask))
 
-                # 训练用的 reward（含弃牌塑形）
+                # 训练轨迹
                 traj["obs"].append(obs)
                 traj["a_type"].append(a_type)
                 traj["a_mask"].append(a_mask)
-                traj["logp"].append(logp)
+                traj["logp_type"].append(logp_type)
+                traj["logp_mask"].append(logp_mask)
                 traj["val"].append(val)
                 traj["rew"].append(reward)
                 traj["done"].append(done)
 
-                # 统计：训练总回报
+                # 统计：训练总回报（含弃牌塑形）
                 ep_ret_train += reward
-                # 统计：画图回报（只记录出牌的 reward）
+                # 统计：只记录出牌的 reward（画图）
                 if a_type == 1:
                     ep_ret_plot += reward
 
@@ -240,14 +360,16 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
                         "plot_recent5":  f"{recent5_plot:.1f}",
                         "ret_train":     f"{ep_ret_train:.1f}",
                         "ret_plot":      f"{ep_ret_plot:.1f}",
-                        "ecoef":         f"{agent.ecoef:.3f}"
+                        "ecoef":         f"{agent.ecoef:.3f}",
+                        "coef_dis":      f"{agent.coef_sel_dis:.3f}",
                     })
                 else:
                     pbar.set_postfix({
                         "episodes": 0,
                         "ret_train": f"{ep_ret_train:.1f}",
                         "ret_plot":  f"{ep_ret_plot:.1f}",
-                        "ecoef":     f"{agent.ecoef:.3f}"
+                        "ecoef":     f"{agent.ecoef:.3f}",
+                        "coef_dis":  f"{agent.coef_sel_dis:.3f}",
                     })
 
                 if done:
@@ -260,9 +382,10 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
             # PPO 更新
             agent.update(traj)
 
-            # 熵系数线性退火
+            # 退火：熵系数 & 弃牌 mask 系数
             updates_done += 1
             agent.ecoef = anneal_ecoef()
+            agent.coef_sel_dis = anneal_coef_dis()
 
         pbar.close()
 
@@ -270,7 +393,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
         pbar.close()
         print("\n[Info] 手动中断，保存已训练的权重…")
 
-    # 保存模型（结构与从前一致；仅多存了 shaping_beta 以便复现）
+    # 保存模型（结构与从前一致；仅多存 shaping_beta 以便复现）
     pkg = {
         "state_dict": agent.net.state_dict(),
         "config": {
@@ -298,7 +421,6 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
         x_raw2 = np.arange(len(ep_returns_plot))
         plt.plot(x_raw2, ep_returns_plot,  linewidth=1.6, alpha=0.9,  label="Episode Return (plot, only play rewards)")
 
-        # 平滑只针对“只统计出牌的回报”这一条
         window = min(100, max(5, len(ep_returns_plot)//5))
         if window >= 5:
             y_smooth = smooth_curve(ep_returns_plot, window=window)
@@ -313,6 +435,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
         plt.tight_layout()
         plt.savefig(plot_path, dpi=160)
         print(f"[Plot] 训练曲线已保存到 {plot_path}")
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -355,6 +478,7 @@ def main():
           max_hand_size=args.max_hand_size,
           max_play=args.max_play,
           shaping_beta=args.shaping_beta)
+
 
 if __name__ == "__main__":
     main()
