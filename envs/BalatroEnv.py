@@ -11,9 +11,10 @@ from collections import Counter
 class BalatroEnv(gym.Env):
     metadata = {'render.modes':['human','rgb_array']}
 
-    def __init__(self, max_hand_size=8, hand_multipliers=None, hand_basic_score=None, max_play=5, max_discard=3):
+    def __init__(self, max_hand_size=8, hand_multipliers=None, hand_basic_score=None, max_play=5, max_discard=3, shaping_beta=1.0):
         super().__init__()
         self.max_hand_size = max_hand_size
+        self.shaping_beta = shaping_beta
 
         # 动作空间：多头决策 - Tuple of two separate heads
         self.action_space = spaces.Tuple((
