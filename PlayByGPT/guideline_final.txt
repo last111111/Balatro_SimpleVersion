@@ -1,0 +1,31 @@
+### Balatro Action Guidelines
+
+#### When to PLAY:
+- **Select 1 to 5 cards**: Ensure the number of selected cards is between 1 and 5.
+- **Aim for high-scoring patterns**: Prioritize combinations that form recognized patterns (e.g., Straight Flush, Four of a Kind, Full House).
+- **Evaluate potential**: Choose cards that maximize the scoring formula: (sum of ranks + base score) × multiplier.
+- **Avoid exceeding limits**: Do not attempt to play more than 5 cards in a single action.
+- **Consider hand synergy**: Look for cards that work well together to form higher-scoring combinations.
+
+#### When to DISCARD:
+- **Exceeding card limit**: If your hand has more than 8 cards, discard cards to comply with the rules.
+- **Weak hand improvement**: Discard cards that do not contribute to a strong pattern or scoring potential to improve future hands.
+- **Maximize future plays**: Use discards strategically to draw better cards from the deck.
+- **Limit discards**: Discard only 1 to 3 cards at a time, ensuring you maintain a minimum of 3 cards in hand for future plays.
+- **Avoid discarding potential scoring combinations**: Be cautious not to discard cards that could form pairs, three of a kinds, or other valuable patterns.
+
+#### Card Selection Tips:
+- **Focus on valid combinations**: Always ensure selected cards can form a valid pattern.
+- **Avoid discarding high-value cards**: Retain cards that can contribute to potential high-scoring combinations, especially pairs or high cards.
+- **Be cautious with low-value cards**: Discard cards that do not contribute to potential scoring combinations while keeping higher-ranked cards.
+
+#### General Strategy:
+- **Early game**: Discard to improve hand potential without scoring penalties.
+- **Mid to late game**: Focus on playing high-scoring combinations as your hand stabilizes.
+
+#### Common Mistakes to Avoid:
+- **Playing too many cards**: Ensure you do not select more than 5 cards for play.
+- **Ignoring patterns**: Always check if the selected cards form a valid scoring pattern; otherwise, prioritize the highest card available.
+- **Neglecting discards**: Use discards to refine your hand and increase future scoring potential.
+- **Discarding too many cards**: Avoid discarding multiple cards at once unless necessary, as this can weaken your hand and leave you with insufficient cards for future plays.
+- **Discarding cards with potential**: Be mindful of keeping cards that could lead to valuable combinations, even if they do not currently form a pattern.

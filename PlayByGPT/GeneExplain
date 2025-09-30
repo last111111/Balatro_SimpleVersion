@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""
+LLM Review Pipeline for Balatro Actions:
+- Read selected_traj.csv (top/bottom advantages for play/discard)
+- Build English narrations: "Your hand is [...]. You played/discarded the cards [...]."
+- LLM reviews each narration: Correct/Incorrect + reason; if Incorrect -> recommendation + reason
+- Save results to CSV
+
+Requirements:
+  pip install openai pandas numpy tqdm
+  Ensure config.py contains OPENAI_API_KEY
+"""
+
+import os
+import sys
+import json
+from typing import List, Dict, Any, Optional, Tuple
+import pandas as pd
+import numpy as np
+
+from openai import OpenAI
+from config import OPENAI_API_KEY
+from tqdm import tqdm  # 进度条
+
+# ======================
+# OpenAI Client
+# ======================
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ======================
+# 1) Narration Builder
+# ======================
+def build_narrations_from_selected_traj(
+    csv_path: str
+) -> Tuple[List[str], pd.DataFrame]:
+    """
+    Read selected_traj CSV and build English narrations.
+    Returns:
+        narrations: List[str], each narration formatted in English.
+        df: the original dataframe (with parsed JSON fields)
+    CSV columns expected:
+        - episode
+        - t
+        - action               ("play" or "discard")
+        - reward
+        - remaining_plays
+        - remaining_discards
+        - hand_before          (JSON array of card strings, e.g. ["1H", "5D", ...])
+        - cards                (JSON array of selected card strings)
+        - deck_remaining       (JSON array of card strings)
+        - advantage
+    """
+    df = pd.read_csv(csv_path)
+
+    # Ensure JSON arrays are parsed
+    def parse_json_list(x):
+        if isinstance(x, str):
+            try:
+                return json.loads(x)
+            except Exception:
+                return []
+        return [] if pd.isna(x) else x
+
+    df["hand_before_list"] = df["hand_before"].apply(parse_json_list)
+    df["cards_list"] = df["cards"].apply(parse_json_list)
+
+    narrations = []
+    for idx, row in df.iterrows():
+        hand = row.get("hand_before_list", [])
+        sel  = row.get("cards_list", [])
+        action = str(row.get("action", "")).strip().lower()
+
+        # Build plain English narration
+        hand_str = ", ".join(map(str, hand)) if hand else "(empty)"
+        sel_str  = ", ".join(map(str, sel)) if sel else "(empty)"
+
+        if action == "play":
+            narration = f"Your hand is [{hand_str}]. You played the cards [{sel_str}]."
+        elif action == "discard":
+            narration = f"Your hand is [{hand_str}]. You discarded the cards [{sel_str}]."
+        else:
+            narration = f"Your hand is [{hand_str}]. Unknown action with selected cards [{sel_str}]."
+
+        narrations.append(narration)
+
+    return narrations, df
+
+
+# ======================
+# 2) System Prompt Builder
+# ======================
+def build_review_system_prompt() -> str:
+    """
+    Expert system prompt describing the rules and expectations for revision.
+    """
+    lines = []
+    lines.append("You are a Balatro expert. You review actual gameplay steps and diagnose correctness.")
+    lines.append("Output must be STRICT JSON through the provided function call (no extra text).")
+    lines.append("")
+    lines.append("Game rules summary:")
+    lines.append("- One action per step: 0=discard, 1=play.")
+    lines.append("- Hand size is up to max_hand_size (8 typically). Mask selections choose cards from hand positions.")
+    lines.append("- For play: 1~5 cards may be selected. Score is computed as:")
+    lines.append("  (sum of ranks in the combination + base score for the pattern) × multiplier.")
+    lines.append("- Recognized patterns: Straight Flush, Four of a Kind, Full House, Flush, Straight,")
+    lines.append("  Three of a Kind, Two Pair, One Pair, High Card.")
+    lines.append("- For High Card: if no pattern is formed, score uses only the single highest rank selected, not all cards.")
+    lines.append("- The environment automatically finds the best-scoring valid combination among selected cards.")
+    lines.append("")
+    lines.append("Your task: Given an action narration (hand + selected cards + play/discard),")
+    lines.append("judge whether it is Correct or Incorrect as a decision in the given context.")
+    lines.append("If Incorrect, provide a recommended action and a clear rationale.")
+    lines.append("")
+    lines.append("Return fields: is_correct, reason,")
+    lines.append("and if Incorrect: recommended_action_type ('play'|'discard'), recommended_selected_cards (list), recommended_reason.")
+    lines.append("You must not output anything outside the JSON function call result.")
+    return "\n".join(lines)
+
+
+# ======================
+# 3) LLM Review Function
+# ======================
+def llm_review_narration(narration: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Send one narration to LLM for review.
+    Returns a dict with keys:
+        - is_correct: "Correct" or "Incorrect"
+        - reason: str
+        - recommended_action_type: "play"|"discard"|None
+        - recommended_selected_cards: list[str]|None
+        - recommended_reason: str|None
+    """
+    if system_prompt is None:
+        system_prompt = build_review_system_prompt()
+
+    # Updated English user prompt
+    user_prompt = (
+        "This is an actual gameplay action. You are an expert in this game with rich correction experience. "
+        "You must diagnose whether this action is Correct or Incorrect, and provide a reason. "
+        "If you think it is Incorrect, you must also provide a recommended action and a recommended reason. "
+        "Finally, you must strictly output JSON in the required format.\n\n"
+        "Action narration:\n"
+        f"{narration}\n"
+    )
+
+    # The JSON schema for the function tool
+    schema = {
+        "type": "object",
+        "properties": {
+            "is_correct": {"type": "string", "enum": ["Correct", "Incorrect"]},
+            "reason": {"type": "string"},
+            "recommended_action_type": {"type": ["string", "null"], "enum": ["play", "discard", None]},
+            "recommended_selected_cards": {"type": ["array", "null"], "items": {"type": "string"}},
+            "recommended_reason": {"type": ["string", "null"]}
+        },
+        "required": ["is_correct","reason","recommended_action_type","recommended_selected_cards","recommended_reason"],
+        "additionalProperties": False
+    }
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "review_balatro_action",
+                    "description": "Review correctness of Balatro narrated action.",
+                    "parameters": schema
+                }
+            }],
+            tool_choice={"type": "function", "function": {"name": "review_balatro_action"}}
+        )
+        calls = resp.choices[0].message.tool_calls
+        if not calls:
+            # Safety fallback
+            return {
+                "is_correct": "Incorrect",
+                "reason": "LLM returned no function call.",
+                "recommended_action_type": None,
+                "recommended_selected_cards": None,
+                "recommended_reason": None
+            }
+
+        args_json = calls[0].function.arguments  # JSON string from tool call
+        parsed = json.loads(args_json)
+
+        # Enforce "only if incorrect" rule (normalize the output)
+        if parsed.get("is_correct") == "Correct":
+            parsed["recommended_action_type"] = None
+            parsed["recommended_selected_cards"] = None
+            parsed["recommended_reason"] = None
+
+        return parsed
+
+    except Exception as e:
+        return {
+            "is_correct": "Incorrect",
+            "reason": f"LLM exception: {repr(e)}",
+            "recommended_action_type": None,
+            "recommended_selected_cards": None,
+            "recommended_reason": None
+        }
+
+
+# ======================
+# 4) Main Pipeline
+# ======================
+def run_review_pipeline(
+    input_csv: str = "selected_traj.csv",
+    output_csv: str = "llm_review_results.csv"
+):
+    """
+    - Load selected_traj.csv
+    - Build narrations (English)
+    - LLM reviews each narration
+    - Save results to CSV merged with original metadata
+    """
+    narrations, df_src = build_narrations_from_selected_traj(input_csv)
+    system_prompt = build_review_system_prompt()
+
+    results = []
+    # 用 tqdm 添加进度条
+    for i, narration in enumerate(tqdm(narrations, desc="Reviewing narrations")):
+        review = llm_review_narration(narration, system_prompt=system_prompt)
+        results.append({
+            "narration": narration,
+            "is_correct": review.get("is_correct", ""),
+            "reason": review.get("reason", ""),
+            "recommended_action_type": review.get("recommended_action_type", None),
+            "recommended_selected_cards": json.dumps(review.get("recommended_selected_cards", None), ensure_ascii=False) \
+                if review.get("recommended_selected_cards", None) is not None else None,
+            "recommended_reason": review.get("recommended_reason", None)
+        })
+
+    df_results = pd.DataFrame(results)
+
+    # Merge with source (to keep episode/t/action/reward/advantage references)
+    if len(df_src) != len(df_results):
+        print("[WARN] Source rows and LLM results length mismatch; aligning shorter length.")
+    n = min(len(df_src), len(df_results))
+    df_src = df_src.iloc[:n].copy()
+    df_results = df_results.iloc[:n].copy()
+
+    # Combine both
+    df_out = pd.concat([df_src.reset_index(drop=True), df_results.reset_index(drop=True)], axis=1)
+    df_out.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"[Save] LLM review results -> {output_csv}")
+
+    return df_out
+
+
+# ======================
+# Entry
+# ======================
+if __name__ == "__main__":
+    # You can adjust these paths as needed
+    INPUT_CSV = "PlayByGPT/selected_traj.csv"     # the CSV generated from top/bottom advantage sampling
+    OUTPUT_CSV = "llm_review_results.csv"
+
+    run_review_pipeline(INPUT_CSV, OUTPUT_CSV)
