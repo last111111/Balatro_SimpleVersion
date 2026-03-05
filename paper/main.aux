@@ -1,0 +1,98 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{mnih2015human}
+\citation{vinyals2019grandmaster}
+\citation{brown2019superhuman}
+\citation{bard2020hanabi}
+\citation{lewis2020retrieval}
+\citation{yan2024efficient}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces The hand-play phase in Balatro. The player is dealt 8 cards and must select cards to play as a poker hand or discard. The left panel shows the current blind target, equipped Joker, detected hand type with base scoring values, remaining hands/discards, and current funds.}}{1}{figure.1}\protected@file@percent }
+\newlabel{fig:gameplay}{{1}{1}{The hand-play phase in Balatro. The player is dealt 8 cards and must select cards to play as a poker hand or discard. The left panel shows the current blind target, equipped Joker, detected hand type with base scoring values, remaining hands/discards, and current funds}{figure.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {II}Balatro: Game Overview}{1}{section.2}\protected@file@percent }
+\newlabel{sec:game}{{II}{1}{Balatro: Game Overview}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}Core Game Phases}{1}{subsection.2.1}\protected@file@percent }
+\newlabel{eq:score}{{1}{1}{Core Game Phases}{equation.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Poker hand types with base scoring values (Level 1). Planet cards can level up each hand type, permanently increasing its base values.}}{2}{table.1}\protected@file@percent }
+\newlabel{tab:handtypes}{{I}{2}{Poker hand types with base scoring values (Level 1). Planet cards can level up each hand type, permanently increasing its base values}{table.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Balatro introduces special poker hands beyond the standard ranking. \textit  {Five of a Kind}: five cards of the same rank. \textit  {Flush House}: a Full House where all cards share a suit. \textit  {Flush Five}: five identical-rank cards of one suit. These hands yield significantly higher base scores.}}{2}{figure.2}\protected@file@percent }
+\newlabel{fig:special_hands}{{2}{2}{Balatro introduces special poker hands beyond the standard ranking. \textit {Five of a Kind}: five cards of the same rank. \textit {Flush House}: a Full House where all cards share a suit. \textit {Flush Five}: five identical-rank cards of one suit. These hands yield significantly higher base scores}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}Jokers: The Key Strategic Element}{2}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:game:jokers}{{\mbox  {II-B}}{2}{Jokers: The Key Strategic Element}{subsection.2.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-C}}Challenges for RL}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-D}}Our Simplified Game Model}{2}{subsection.2.4}\protected@file@percent }
+\citation{vanhasselt2016deep}
+\citation{schulman2017proximal}
+\citation{huang2022closer}
+\citation{yan2024efficient}
+\citation{lewis2020retrieval}
+\citation{yan2024efficient,levine2018reinforcement}
+\@writefile{toc}{\contentsline {section}{\numberline {III}Environment Design}{3}{section.3}\protected@file@percent }
+\newlabel{sec:env}{{III}{3}{Environment Design}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}Hand-Play Environment}{3}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:handplay_env}{{\mbox  {III-A}}{3}{Hand-Play Environment}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Joker Selection Environment}{3}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Method}{3}{section.4}\protected@file@percent }
+\newlabel{sec:method}{{IV}{3}{Method}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}Hand-Play Agents}{3}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:handplay_agents}{{\mbox  {IV-A}}{3}{Hand-Play Agents}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}Joker Agent: PPO with Hesitation-Gated LLM Prior}{3}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:llm_prior}{{\mbox  {IV-B}}{3}{Joker Agent: PPO with Hesitation-Gated LLM Prior}{subsection.4.2}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-B}1}LLM as Action Prior via RAG}{3}{subsubsection.4.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-B}2}Bayesian Framework: Variational Inference with LLM Prior}{3}{subsubsection.4.2.2}\protected@file@percent }
+\newlabel{eq:vi_objective}{{3}{3}{Bayesian Framework: Variational Inference with LLM Prior}{equation.3}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-B}3}Hesitation Gate}{4}{subsubsection.4.2.3}\protected@file@percent }
+\newlabel{eq:hesitation}{{4}{4}{Hesitation Gate}{equation.4}{}}
+\newlabel{eq:gate}{{5}{4}{Hesitation Gate}{equation.5}{}}
+\newlabel{eq:ppo_prior}{{6}{4}{Hesitation Gate}{equation.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Experiments}{4}{section.5}\protected@file@percent }
+\newlabel{sec:results}{{V}{4}{Experiments}{section.5}{}}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Hesitation-Gated PPO with LLM Prior}}{4}{algorithm.1}\protected@file@percent }
+\newlabel{alg:hg_ppo}{{1}{4}{Hesitation Gate}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-A}}Experimental Setup}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-B}}Experiment 1: Hand-Play Phase (DDQN vs. PPO)}{4}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-C}}Experiment 2: Joker Selection with LLM Prior}{4}{subsection.5.3}\protected@file@percent }
+\citation{mnih2015human}
+\citation{vinyals2019grandmaster}
+\citation{berner2019dota}
+\citation{kuttler2020nethack}
+\citation{guss2019minerl}
+\citation{pleines2025pokemon}
+\citation{brown2019superhuman}
+\citation{bard2020hanabi}
+\citation{santos2017monte}
+\citation{saavedraSTS2024}
+\citation{zhang2024llmguide}
+\citation{yan2024efficient,levine2018reinforcement}
+\citation{huang2022closer}
+\bibstyle{IEEEtran}
+\bibdata{references}
+\bibcite{mnih2015human}{1}
+\bibcite{vinyals2019grandmaster}{2}
+\bibcite{brown2019superhuman}{3}
+\bibcite{bard2020hanabi}{4}
+\bibcite{lewis2020retrieval}{5}
+\bibcite{yan2024efficient}{6}
+\bibcite{vanhasselt2016deep}{7}
+\bibcite{schulman2017proximal}{8}
+\bibcite{huang2022closer}{9}
+\bibcite{levine2018reinforcement}{10}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-D}}Experiment 3: Hesitation Gate Ablation}{5}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-E}}Experiment 4: End-to-End Evaluation}{5}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Related Work}{5}{section.6}\protected@file@percent }
+\newlabel{sec:related}{{VI}{5}{Related Work}{section.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VII}Discussion and Limitations}{5}{section.7}\protected@file@percent }
+\newlabel{sec:discussion}{{VII}{5}{Discussion and Limitations}{section.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VIII}Conclusion}{5}{section.8}\protected@file@percent }
+\newlabel{sec:conclusion}{{VIII}{5}{Conclusion}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{References}{5}{section*.1}\protected@file@percent }
+\bibcite{berner2019dota}{11}
+\bibcite{kuttler2020nethack}{12}
+\bibcite{guss2019minerl}{13}
+\bibcite{pleines2025pokemon}{14}
+\bibcite{santos2017monte}{15}
+\bibcite{saavedraSTS2024}{16}
+\bibcite{zhang2024llmguide}{17}
+\gdef \@abspage@last{6}
