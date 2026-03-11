@@ -814,6 +814,8 @@ def train_card_hesitation(
     num_votes=5,
     llm_temperature=0.7,
     gpu_memory_utilization=0.85,
+    # Resume from checkpoint
+    resume_checkpoint="",
     # Output directory (可指向 Drive 路径以持久化)
     output_dir="outputs/card_hesitation",
 ):
@@ -821,6 +823,7 @@ def train_card_hesitation(
     Train card agent with hesitation-gated LLM prior.
 
     If llm_model is empty, falls back to pure PPO (no LLM).
+    If resume_checkpoint is given, loads weights + optimizer and continues from saved step.
     """
     set_seed(seed)
     device = get_device()
@@ -869,10 +872,25 @@ def train_card_hesitation(
         llm_prior=llm_prior,
     )
 
+    # ── Resume from checkpoint ─────────────────────────────────
+    resume_step = 0
+    resume_episode = 0
+    if resume_checkpoint:
+        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        agent.net.load_state_dict(ckpt["state_dict"])
+        if "optimizer" in ckpt:
+            agent.opt.load_state_dict(ckpt["optimizer"])
+        resume_step = ckpt.get("step", 0)
+        resume_episode = ckpt.get("episode", 0)
+        if "config" in ckpt and "alpha" in ckpt["config"]:
+            agent.alpha = ckpt["config"]["alpha"]
+        print(f"[Resume] Loaded {resume_checkpoint}")
+        print(f"[Resume] Continuing from step={resume_step}, episode={resume_episode}, α={agent.alpha:.4f}")
+
     print(f"[Init] device={device}, seed={seed}, total_steps={total_steps}")
     print(f"[Init] Run name: {run_name}")
 
-    updates_done = 0
+    updates_done = resume_step // update_steps
 
     def anneal_ecoef():
         frac = min(1.0, updates_done / max(1, total_updates))
@@ -912,9 +930,9 @@ def train_card_hesitation(
     ])
     csv_file.flush()
 
-    total_collected = 0
-    last_checkpoint_step = 0
-    pbar = tqdm(total=total_steps, desc="Card Hesitation Training", unit="step", dynamic_ncols=True)
+    total_collected = resume_step
+    last_checkpoint_step = resume_step
+    pbar = tqdm(total=total_steps, initial=resume_step, desc="Card Hesitation Training", unit="step", dynamic_ncols=True)
 
     try:
         while total_collected < total_steps:
@@ -1272,6 +1290,10 @@ Examples:
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85,
                    help="vLLM GPU memory fraction (A100-80GB: 0.85 for Qwen3-32B)")
 
+    # Resume
+    p.add_argument("--resume_checkpoint", type=str, default="",
+                   help="Path to checkpoint .pt file to resume training from")
+
     # Output directory
     p.add_argument("--output_dir", type=str, default="outputs/card_hesitation",
                    help="Output directory for checkpoints/logs/plots (可指向 Drive 路径)")
@@ -1306,6 +1328,7 @@ Examples:
         num_votes=args.num_votes,
         llm_temperature=args.llm_temperature,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        resume_checkpoint=args.resume_checkpoint,
         output_dir=args.output_dir,
     )
 
