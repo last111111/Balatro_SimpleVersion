@@ -290,7 +290,12 @@ class CardLLMActionPrior:
     # ── Single query ──────────────────────────────────────────
     def _query_single(self, prompt, hand):
         try:
-            full_prompt = f"{LLM_SYSTEM_PROMPT}\n\n{prompt}"
+            # ChatML format + /no_think 禁用 Qwen3 思考模式
+            full_prompt = (
+                f"<|im_start|>system\n{LLM_SYSTEM_PROMPT}<|im_end|>\n"
+                f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
             outputs = self.llm.generate([full_prompt], self.sampling_params)
             text = outputs[0].outputs[0].text.strip()
             result = self._parse_response(text, hand)
