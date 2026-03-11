@@ -32,6 +32,7 @@ import sys
 import re
 import math
 import csv
+import json
 import time
 import argparse
 from collections import OrderedDict
@@ -132,7 +133,8 @@ class LLMActionPrior:
     def __init__(self, api_base, api_key, model="Qwen/Qwen3-32B",
                  num_votes=5, num_actions=25,
                  temperature=0.7, timeout=30,
-                 cache_maxsize=2048, rate_limit_delay=0.02):
+                 cache_maxsize=2048, rate_limit_delay=0.02,
+                 llm_log_path=None):
         self.model = model
         self.num_votes = num_votes
         self.num_actions = num_actions
@@ -148,6 +150,13 @@ class LLMActionPrior:
         self._total_queries = 0
         self._cache_hits = 0
         self._valid_votes_history = []  # valid votes per non-cached get_prior call
+
+        # JSONL logger for LLM responses
+        self._llm_log_file = None
+        if llm_log_path:
+            os.makedirs(os.path.dirname(llm_log_path), exist_ok=True)
+            self._llm_log_file = open(llm_log_path, 'a')
+            print(f"[LLM] Response log → {llm_log_path}")
 
     # ── Prompt construction ───────────────────────────────────
     def _build_prompt(self, state_dict):
@@ -204,6 +213,7 @@ class LLMActionPrior:
 
     # ── Single LLM query ─────────────────────────────────────
     def _query_single(self, prompt):
+        raw_text = ""
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -214,16 +224,17 @@ class LLMActionPrior:
                 max_tokens=10,
                 temperature=self.temperature,
             )
-            text = response.choices[0].message.content.strip()
+            raw_text = response.choices[0].message.content.strip()
             # Handle Qwen3 thinking tags: strip <think>...</think>
-            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+            text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL).strip()
             match = re.search(r'\d+', text)
             if match:
-                return int(match.group())
-            print(f"[LLM WARNING] Unparseable response: {text!r}")
+                return int(match.group()), raw_text
+            print(f"[LLM WARNING] Unparseable response: {raw_text!r}")
         except Exception as e:
+            raw_text = f"ERROR: {e}"
             print(f"[LLM WARNING] Query failed: {e}")
-        return None
+        return None, raw_text
 
     # ── N-vote prior ──────────────────────────────────────────
     def get_prior(self, state_dict):
@@ -246,10 +257,12 @@ class LLMActionPrior:
 
         counts = np.zeros(self.num_actions, dtype=np.float32)
         valid_votes = 0
+        raw_responses = []
 
         for _ in range(self.num_votes):
-            action = self._query_single(prompt)
+            action, raw_text = self._query_single(prompt)
             self._total_queries += 1
+            raw_responses.append(raw_text)
 
             if action is not None and 0 <= action < self.num_actions:
                 if action_mask[action] > 0:
@@ -282,6 +295,24 @@ class LLMActionPrior:
         self._cache[key] = prior
         if len(self._cache) > self._cache_maxsize:
             self._cache.popitem(last=False)
+
+        # Log LLM responses to JSONL
+        if self._llm_log_file is not None:
+            log_entry = {
+                "query_id": self._total_queries,
+                "round": state_dict["round"],
+                "held": [int(j) for j in state_dict["held"]],
+                "offered": [int(j) for j in state_dict["offered"]],
+                "prompt": prompt,
+                "responses": raw_responses,
+                "valid_votes": valid_votes,
+                "prior_top3": sorted(
+                    [(int(i), float(prior[i])) for i in range(len(prior)) if prior[i] > 0.01],
+                    key=lambda x: -x[1]
+                )[:3],
+            }
+            self._llm_log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            self._llm_log_file.flush()
 
         return prior
 
@@ -666,6 +697,8 @@ def train_joker_hesitation(
     max_hand_size=8,
     max_play=5,
     shaping_beta=0.3,
+    # Output directory (可指向 Drive 路径以持久化)
+    output_dir="outputs/hesitation",
 ):
     """
     Train joker selection agent with hesitation-gated LLM prior.
@@ -679,22 +712,24 @@ def train_joker_hesitation(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"hesitation_run_{timestamp}"
 
-    os.makedirs("outputs/hesitation/checkpoints", exist_ok=True)
-    os.makedirs("outputs/hesitation/logs", exist_ok=True)
-    os.makedirs("outputs/hesitation/plots", exist_ok=True)
+    os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{output_dir}/logs", exist_ok=True)
+    os.makedirs(f"{output_dir}/plots", exist_ok=True)
 
-    log_path = f"outputs/hesitation/logs/{run_name}.csv"
-    checkpoint_dir = "outputs/hesitation/checkpoints"
+    log_path = f"{output_dir}/logs/{run_name}.csv"
+    checkpoint_dir = f"{output_dir}/checkpoints"
 
     # ── LLM prior ────────────────────────────────────────────
     llm_prior = None
     if api_base:
         # vLLM 本地部署不需要真实密钥，用占位符即可
         actual_key = api_key if api_key else "EMPTY"
+        llm_log_path = f"{output_dir}/logs/{run_name}_llm_responses.jsonl"
         llm_prior = LLMActionPrior(
             api_base=api_base, api_key=actual_key, model=llm_model,
             num_votes=num_votes, temperature=llm_temperature,
             timeout=llm_timeout, rate_limit_delay=rate_limit_delay,
+            llm_log_path=llm_log_path,
         )
         print(f"[Init] LLM prior: {llm_model} via {api_base}, N={num_votes}, τ={tau}, α={alpha}")
     else:
@@ -984,7 +1019,7 @@ def train_joker_hesitation(
         ax.grid(True, ls='--', alpha=0.4); ax.legend()
 
         plt.tight_layout()
-        plot_path = f"outputs/hesitation/plots/{run_name}_curve.png"
+        plot_path = f"{output_dir}/plots/{run_name}_curve.png"
         plt.savefig(plot_path, dpi=160)
         if 'google.colab' in sys.modules:
             plt.show()
@@ -1077,6 +1112,10 @@ Examples:
     p.add_argument("--max_play", type=int, default=5)
     p.add_argument("--shaping_beta", type=float, default=0.3)
 
+    # Output directory
+    p.add_argument("--output_dir", type=str, default="outputs/hesitation",
+                   help="Output directory for checkpoints/logs/plots (可指向 Drive 路径)")
+
     args = p.parse_args()
 
     train_joker_hesitation(
@@ -1109,6 +1148,7 @@ Examples:
         max_hand_size=args.max_hand_size,
         max_play=args.max_play,
         shaping_beta=args.shaping_beta,
+        output_dir=args.output_dir,
     )
 
 

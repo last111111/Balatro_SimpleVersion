@@ -29,6 +29,7 @@ import sys
 import re
 import math
 import csv
+import json
 import time
 import argparse
 from collections import OrderedDict
@@ -184,7 +185,7 @@ class CardLLMActionPrior:
 
     def __init__(self, model_name="Qwen/Qwen3-32B", num_votes=5,
                  temperature=0.7, cache_maxsize=2048,
-                 gpu_memory_utilization=0.85):
+                 gpu_memory_utilization=0.85, llm_log_path=None):
         self.model_name = model_name
         self.num_votes = num_votes
         self.temperature = temperature
@@ -211,6 +212,13 @@ class CardLLMActionPrior:
         self._total_queries = 0
         self._cache_hits = 0
         self._valid_votes_history = []  # valid votes per non-cached get_prior call
+
+        # JSONL logger for LLM responses
+        self._llm_log_file = None
+        if llm_log_path:
+            os.makedirs(os.path.dirname(llm_log_path), exist_ok=True)
+            self._llm_log_file = open(llm_log_path, 'a')
+            print(f"[LLM] Response log → {llm_log_path}")
 
     # ── Prompt construction ───────────────────────────────────
     def _build_prompt(self, env):
@@ -297,10 +305,10 @@ class CardLLMActionPrior:
             result = self._parse_response(text, hand)
             if result[0] is None:
                 print(f"[LLM WARNING] Unparseable response: {text!r}")
-            return result
+            return result, text
         except Exception as e:
             print(f"[LLM WARNING] Query failed: {e}")
-            return None, None
+            return (None, None), str(e)
 
     # ── N-vote prior ──────────────────────────────────────────
     def get_prior(self, env):
@@ -330,10 +338,12 @@ class CardLLMActionPrior:
         type_counts = np.zeros(2, dtype=np.float32)  # [discard, play]
         card_counts = np.zeros(52, dtype=np.float32)
         valid_votes = 0
+        raw_responses = []
 
         for _ in range(self.num_votes):
-            action_type, card_indices = self._query_single(prompt, hand)
+            (action_type, card_indices), raw_text = self._query_single(prompt, hand)
             self._total_queries += 1
+            raw_responses.append(raw_text)
 
             if action_type is not None and card_indices:
                 type_counts[action_type] += 1
@@ -370,6 +380,20 @@ class CardLLMActionPrior:
         self._cache[key] = result
         if len(self._cache) > self._cache_maxsize:
             self._cache.popitem(last=False)
+
+        # Log LLM responses to JSONL
+        if self._llm_log_file is not None:
+            hand_strs = [_card_to_str(r, s) for r, s in hand]
+            log_entry = {
+                "query_id": self._total_queries,
+                "prompt": prompt,
+                "responses": raw_responses,
+                "valid_votes": valid_votes,
+                "p_type": p_type.tolist(),
+                "hand": hand_strs,
+            }
+            self._llm_log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            self._llm_log_file.flush()
 
         return result
 
@@ -794,6 +818,8 @@ def train_card_hesitation(
     num_votes=5,
     llm_temperature=0.7,
     gpu_memory_utilization=0.85,
+    # Output directory (可指向 Drive 路径以持久化)
+    output_dir="outputs/card_hesitation",
 ):
     """
     Train card agent with hesitation-gated LLM prior.
@@ -806,21 +832,23 @@ def train_card_hesitation(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"card_hesitation_{timestamp}"
 
-    os.makedirs("outputs/card_hesitation/checkpoints", exist_ok=True)
-    os.makedirs("outputs/card_hesitation/logs", exist_ok=True)
-    os.makedirs("outputs/card_hesitation/plots", exist_ok=True)
+    os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{output_dir}/logs", exist_ok=True)
+    os.makedirs(f"{output_dir}/plots", exist_ok=True)
 
-    checkpoint_dir = "outputs/card_hesitation/checkpoints"
-    log_path = f"outputs/card_hesitation/logs/{run_name}.csv"
+    checkpoint_dir = f"{output_dir}/checkpoints"
+    log_path = f"{output_dir}/logs/{run_name}.csv"
 
     # ── LLM prior ────────────────────────────────────────────
     llm_prior = None
     if llm_model:
+        llm_log_path = f"{output_dir}/logs/{run_name}_llm_responses.jsonl"
         llm_prior = CardLLMActionPrior(
             model_name=llm_model,
             num_votes=num_votes,
             temperature=llm_temperature,
             gpu_memory_utilization=gpu_memory_utilization,
+            llm_log_path=llm_log_path,
         )
         print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, τ={tau}, α={alpha}")
     else:
@@ -1166,7 +1194,7 @@ def train_card_hesitation(
         ax.set_title('Score Distribution'); ax.grid(True, ls='--', alpha=0.4); ax.legend()
 
         plt.tight_layout()
-        plot_path = f"outputs/card_hesitation/plots/{run_name}_curve.png"
+        plot_path = f"{output_dir}/plots/{run_name}_curve.png"
         plt.savefig(plot_path, dpi=160)
         if 'google.colab' in sys.modules:
             plt.show()
@@ -1248,6 +1276,10 @@ Examples:
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85,
                    help="vLLM GPU memory fraction (A100-80GB: 0.85 for Qwen3-32B)")
 
+    # Output directory
+    p.add_argument("--output_dir", type=str, default="outputs/card_hesitation",
+                   help="Output directory for checkpoints/logs/plots (可指向 Drive 路径)")
+
     args = p.parse_args()
 
     train_card_hesitation(
@@ -1278,6 +1310,7 @@ Examples:
         num_votes=args.num_votes,
         llm_temperature=args.llm_temperature,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        output_dir=args.output_dir,
     )
 
 
