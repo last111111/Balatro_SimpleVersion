@@ -148,36 +148,28 @@ def _parse_card_str(s):
 # ════════════════════════════════════════════════════════════════
 
 LLM_SYSTEM_PROMPT = """\
-You are an expert Balatro card game player deciding which cards to play or discard.
+You are an expert Balatro card game player. Given a hand, reply with EXACTLY one line:
+PLAY card1 card2 ...
+or
+DISCARD card1 card2 ...
 
-Game rules:
-- 52-card deck, 8-card hand, 5 plays + 3 discards total.
-- Play 1-5 cards to score. Discard unwanted cards to draw replacements.
-- Score = chips × mult. Chips and mult start from the hand type base, then card chips and joker effects are added.
+Rules: 52-card deck, 8-card hand, 5 plays + 3 discards. Play 1-5 cards to score (chips × mult). Discard to draw replacements.
+Hand types: High Card(5), Pair(20), Two Pair(40), Three of a Kind(90), Straight(120), Flush(140), Full House(160), Four of a Kind(420), Straight Flush(800).
+Card chips: A=11, K/Q/J/10=10, 9=9, ..., 2=2. Jokers add chips/mult/X-mult.
 
-Hand types (base_chips × base_mult = base score):
-  High Card:        5 × 1 =    5
-  Pair:            10 × 2 =   20
-  Two Pair:        20 × 2 =   40
-  Three of a Kind: 30 × 3 =   90
-  Straight:        30 × 4 =  120   (5 consecutive ranks)
-  Flush:           35 × 4 =  140   (5 same suit)
-  Full House:      40 × 4 =  160
-  Four of a Kind:  60 × 7 =  420
-  Straight Flush: 100 × 8 =  800
+Example 1:
+Hand: A♠, A♥, K♦, 10♣, 9♣, 7♦, 5♥, 3♣ | Plays: 4/5, Discards: 2/3
+PLAY A♠ A♥
 
-Card chips added to base: A=11, K/Q/J/10=10, 9=9, ..., 2=2.
-Joker effects: some add chips, some add mult, some MULTIPLY mult (very powerful).
+Example 2:
+Hand: Q♣, J♣, 8♣, 7♦, 6♠, 4♥, 3♣, 2♦ | Plays: 3/5, Discards: 3/3
+DISCARD 7♦ 6♠ 4♥ 2♦
 
-Strategy:
-- Four of a Kind (420) and Straight Flush (800) are extremely strong.
-- Flush (140) and Straight (120) are good; Pair (20) and High Card (5) are weak.
-- Discard weak cards to draw for better hands, but only if discards remain.
-- With few plays left, play your best available hand immediately.
-- Consider active joker synergies (suit bonuses, hand type bonuses).
+Example 3:
+Hand: K♥, K♦, K♣, 9♠, 8♥, 5♦, 4♣, 2♠ | Plays: 5/5, Discards: 0/3
+PLAY K♥ K♦ K♣
 
-Reply with ONLY: "PLAY card1 card2 ..." or "DISCARD card1 card2 ..."
-Nothing else."""
+IMPORTANT: Output ONLY the action line. No explanation, no analysis."""
 
 
 class CardLLMActionPrior:
@@ -203,8 +195,8 @@ class CardLLMActionPrior:
         self.SamplingParams = SamplingParams
         self.sampling_params = SamplingParams(
             temperature=temperature,
-            max_tokens=80,
-            stop=["\n"],
+            max_tokens=300,         # Qwen3 needs room for <think>...</think> + answer
+            stop=["<|im_end|>"],    # proper Qwen3 stop token (不再用 \n 截断)
         )
         print(f"[LLM] Model loaded successfully.")
 
@@ -267,21 +259,42 @@ class CardLLMActionPrior:
     def _parse_response(self, text, hand):
         """
         Parse "PLAY A♠ K♥ ..." or "DISCARD 3♣ 5♥ ..." → (type_int, card_indices)
+        Searches anywhere in text (Qwen3 often prepends analysis before the action line).
         Returns (None, None) if parse fails.
         """
         text = text.strip()
         # Strip Qwen3 thinking tags
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
-        # Detect type
-        upper = text.upper()
-        if upper.startswith("PLAY"):
-            action_type = 1
-            card_part = text[4:].strip()
-        elif upper.startswith("DISCARD"):
-            action_type = 0
-            card_part = text[7:].strip()
-        else:
+        # Search for PLAY or DISCARD anywhere in text (not just at start)
+        # Try each line, then try regex on full text
+        action_type = None
+        card_part = None
+
+        # Strategy 1: line-by-line search
+        for line in text.split('\n'):
+            line = line.strip().strip('`').strip('*').strip()  # strip markdown
+            upper = line.upper()
+            if upper.startswith("PLAY ") or upper == "PLAY":
+                action_type = 1
+                card_part = line[4:].strip()
+                break
+            elif upper.startswith("DISCARD ") or upper == "DISCARD":
+                action_type = 0
+                card_part = line[7:].strip()
+                break
+
+        # Strategy 2: regex search for "PLAY card card..." or "DISCARD card card..."
+        if action_type is None:
+            m = re.search(
+                r'\b(PLAY|DISCARD)\s+((?:[AKQJ2-9]|10)[♥♦♣♠HDCS](?:\s+(?:[AKQJ2-9]|10)[♥♦♣♠HDCS])*)',
+                text, re.IGNORECASE
+            )
+            if m:
+                action_type = 1 if m.group(1).upper() == "PLAY" else 0
+                card_part = m.group(2).strip()
+
+        if action_type is None or card_part is None:
             return None, None
 
         # Parse cards
