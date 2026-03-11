@@ -169,21 +169,26 @@ class CardLLMActionPrior:
 
     def __init__(self, model_name="Qwen/Qwen3-32B", num_votes=5,
                  temperature=0.7, cache_maxsize=2048,
-                 gpu_memory_utilization=0.85, llm_log_path=None):
+                 gpu_memory_utilization=0.85, llm_log_path=None,
+                 quantization=None):
         self.model_name = model_name
         self.num_votes = num_votes
         self.temperature = temperature
 
         # Local vLLM loading
         from vllm import LLM, SamplingParams
-        print(f"[LLM] Loading {model_name} via vLLM (local)...")
-        self.llm = LLM(
+        quant_info = f", quantization={quantization}" if quantization else ""
+        print(f"[LLM] Loading {model_name} via vLLM (local{quant_info})...")
+        llm_kwargs = dict(
             model=model_name,
             trust_remote_code=True,
             gpu_memory_utilization=gpu_memory_utilization,
             enforce_eager=True,       # 避免 Colab CUDA graph 冲突
             max_model_len=4096,       # 我们的 prompt 很短，不需要 40K
         )
+        if quantization:
+            llm_kwargs["quantization"] = quantization
+        self.llm = LLM(**llm_kwargs)
         self.SamplingParams = SamplingParams
         self.sampling_params = SamplingParams(
             temperature=temperature,
@@ -814,6 +819,7 @@ def train_card_hesitation(
     num_votes=5,
     llm_temperature=0.7,
     gpu_memory_utilization=0.85,
+    quantization="",
     # Resume from checkpoint
     resume_checkpoint="",
     # Output directory (可指向 Drive 路径以持久化)
@@ -848,6 +854,7 @@ def train_card_hesitation(
             temperature=llm_temperature,
             gpu_memory_utilization=gpu_memory_utilization,
             llm_log_path=llm_log_path,
+            quantization=quantization if quantization else None,
         )
         print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, τ={tau}, α={alpha}")
     else:
@@ -1289,6 +1296,8 @@ Examples:
     p.add_argument("--llm_temperature", type=float, default=0.7)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85,
                    help="vLLM GPU memory fraction (A100-80GB: 0.85 for Qwen3-32B)")
+    p.add_argument("--quantization", type=str, default="",
+                   help="Quantization method: awq, gptq, etc. (空=FP16)")
 
     # Resume
     p.add_argument("--resume_checkpoint", type=str, default="",
@@ -1328,6 +1337,7 @@ Examples:
         num_votes=args.num_votes,
         llm_temperature=args.llm_temperature,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        quantization=args.quantization,
         resume_checkpoint=args.resume_checkpoint,
         output_dir=args.output_dir,
     )
