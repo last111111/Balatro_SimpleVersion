@@ -57,40 +57,6 @@ from envs.BalatroEnv import BalatroEnv
 if 'google.colab' in sys.modules:
     matplotlib.use('module://matplotlib_inline.backend_inline')
 
-# ── Joker descriptions (for LLM prompt context) ────────────────
-JOKER_DESCRIPTIONS = {
-    0:  "Joker - +4 Mult",
-    1:  "Greedy Joker - +3 Mult for each Diamond card scored",
-    2:  "Lusty Joker - +3 Mult for each Heart card scored",
-    3:  "Wrathful Joker - +3 Mult for each Spade card scored",
-    4:  "Gluttonous Joker - +3 Mult for each Club card scored",
-    5:  "Jolly Joker - +8 Mult if hand contains a Pair",
-    6:  "Zany Joker - +12 Mult if hand contains Three of a Kind",
-    7:  "Mad Joker - +10 Mult if hand contains Two Pair",
-    8:  "Crazy Joker - +12 Mult if hand contains a Straight",
-    9:  "Droll Joker - +10 Mult if hand contains a Flush",
-    10: "Half Joker - +20 Mult if hand has 3 or fewer cards",
-    11: "Steel Joker - +0.2 X Mult per Steel card in hand",
-    12: "Joker Stencil - X1 Mult for each empty Joker slot",
-    13: "Four Fingers - Flushes and Straights can be made with 4 cards",
-    14: "Banner - +30 Chips for each discard remaining",
-    15: "Mystic Summit - +15 Mult if 0 discards remaining",
-    16: "Misprint - +? Mult (random 0 to 23)",
-    17: "Raised Fist - Adds 2x the rank of lowest held card to Mult",
-    18: "Fibonacci - +8 Mult for each A, 2, 3, 5, 8 scored",
-    19: "Even Steven - +4 Mult for each even rank card scored (2,4,6,8,10)",
-    20: "Odd Todd - +31 Chips for each odd rank card scored (A,3,5,7,9)",
-    21: "Blackboard - X3 Mult if all held cards are Spades or Clubs",
-    22: "Ice Cream - +100 Chips, but loses 5 Chips per round played",
-    23: "Blue Joker - +2 Chips for each remaining card in the deck",
-    24: "Runner - +15 Chips if hand contains a Straight (grows each time)",
-    25: "Supernova - +Mult equal to the number of times this hand type has been played",
-    26: "Ride the Bus - +1 Mult per consecutive hand played without a face card",
-    27: "Spare Trousers - +2 Mult if hand contains Two Pair (grows each time)",
-    28: "Abstract Joker - +3 Mult for each Joker you own",
-    29: "Loyalty Card - X4 Mult every 6 hands played",
-}
-
 RANK_NAMES = {1: 'A', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7',
               8: '8', 9: '9', 10: '10', 11: 'J', 12: 'Q', 13: 'K'}
 SUIT_SYMBOLS = {'H': '♥', 'D': '♦', 'C': '♣', 'S': '♠'}
@@ -153,9 +119,35 @@ PLAY card1 card2 ...
 or
 DISCARD card1 card2 ...
 
-Rules: 52-card deck, 8-card hand, 5 plays + 3 discards. Play 1-5 cards to score (chips × mult). Discard to draw replacements.
-Hand types: High Card(5), Pair(20), Two Pair(40), Three of a Kind(90), Straight(120), Flush(140), Full House(160), Four of a Kind(420), Straight Flush(800).
-Card chips: A=11, K/Q/J/10=10, 9=9, ..., 2=2. Jokers add chips/mult/X-mult.
+Game rules:
+- Standard 52-card deck (ranks A,2-10,J,Q,K; suits ♥♦♣♠). You hold 8 cards.
+- Each round you have 5 play actions and 3 discard actions.
+- PLAY: select 1-5 cards from your hand to score. Score = base_chips × base_mult + card chip bonuses.
+- DISCARD: select cards you don't want, they are removed and you draw replacements from the deck.
+- Goal: maximize total score across all plays.
+
+Scoring — hand types (base_chips × base_mult):
+  High Card:        5 × 1 =     5   (any single card)
+  Pair:            10 × 2 =    20   (two cards of same rank)
+  Two Pair:        20 × 2 =    40   (two different pairs)
+  Three of a Kind: 30 × 3 =    90   (three cards of same rank)
+  Straight:        30 × 4 =   120   (5 cards with consecutive ranks, e.g. 5-6-7-8-9)
+  Flush:           35 × 4 =   140   (5 cards of the same suit)
+  Full House:      40 × 4 =   160   (three of a kind + a pair)
+  Four of a Kind:  60 × 7 =   420   (four cards of same rank)
+  Straight Flush: 100 × 8 =   800   (straight + flush combined)
+
+Card chip values (added to base chips for each scored card):
+  A=11, K=10, Q=10, J=10, 10=10, 9=9, 8=8, 7=7, 6=6, 5=5, 4=4, 3=3, 2=2
+
+Strategy tips:
+- Four of a Kind (420+) and Straight Flush (800+) are extremely powerful. Prioritize building toward them.
+- Flush (140) and Straight (120) are strong; Full House (160) is better if achievable.
+- Pair (20) and High Card (5) are weak. Discard to improve if discards remain.
+- When discards remain and your hand is weak, DISCARD low-value cards to draw better ones.
+- When plays are limited or you already have a strong hand, PLAY immediately.
+- High-chip cards (A, K, Q, J, 10) contribute more chips when scored.
+- Playing fewer but better cards is sometimes optimal (e.g. PLAY a Pair rather than a weak 5-card hand).
 
 Example 1:
 Hand: A♠, A♥, K♦, 10♣, 9♣, 7♦, 5♥, 3♣ | Plays: 4/5, Discards: 2/3
@@ -230,17 +222,6 @@ class CardLLMActionPrior:
                      f"Discards remaining: {discards_left}/{env.max_discard}")
         lines.append(f"Score so far: {score:.0f}, Deck: {deck_remaining} cards left")
 
-        # Jokers
-        if hasattr(env, 'jokers') and env.jokers:
-            joker_strs = []
-            for j in env.jokers:
-                jid = j.type_id if hasattr(j, 'type_id') else getattr(j, 'joker_type', -1)
-                desc = JOKER_DESCRIPTIONS.get(jid, f"Joker(id={jid})")
-                joker_strs.append(desc)
-            lines.append(f"Active Jokers: {'; '.join(joker_strs)}")
-        else:
-            lines.append("Active Jokers: None")
-
         lines.append("")
         lines.append("Choose your action:")
         return "\n".join(lines)
@@ -248,12 +229,7 @@ class CardLLMActionPrior:
     # ── Cache key ─────────────────────────────────────────────
     def _state_key(self, env):
         hand_key = tuple(sorted(env.hand))
-        joker_ids = []
-        if hasattr(env, 'jokers') and env.jokers:
-            for j in env.jokers:
-                jid = j.type_id if hasattr(j, 'type_id') else getattr(j, 'joker_type', -1)
-                joker_ids.append(jid)
-        return (hand_key, env.play_count, env.discard_count, tuple(joker_ids))
+        return (hand_key, env.play_count, env.discard_count)
 
     # ── Parse LLM response ───────────────────────────────────
     def _parse_response(self, text, hand):
