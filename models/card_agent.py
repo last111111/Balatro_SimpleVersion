@@ -46,10 +46,12 @@ class ActorCritic(nn.Module):
 
         self.card_encoder = CardEncoder(embed_dim=card_embed_dim)
 
-        # 共享编码器（3层，512→512→256，Tanh）
+        # 共享编码器（5层，512→512→512→512→256，Tanh，对齐 DanZero+）
         encoder_input_dim = obs_dim + card_embed_dim
         self.encoder = nn.Sequential(
             nn.Linear(encoder_input_dim, 512), nn.Tanh(),
+            nn.Linear(512, 512), nn.Tanh(),
+            nn.Linear(512, 512), nn.Tanh(),
             nn.Linear(512, 512), nn.Tanh(),
             nn.Linear(512, 256), nn.Tanh(),
         )

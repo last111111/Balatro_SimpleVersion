@@ -147,6 +147,7 @@ class LLMActionPrior:
         self._cache_maxsize = cache_maxsize
         self._total_queries = 0
         self._cache_hits = 0
+        self._valid_votes_history = []  # valid votes per non-cached get_prior call
 
     # ── Prompt construction ───────────────────────────────────
     def _build_prompt(self, state_dict):
@@ -219,8 +220,9 @@ class LLMActionPrior:
             match = re.search(r'\d+', text)
             if match:
                 return int(match.group())
-        except Exception:
-            pass
+            print(f"[LLM WARNING] Unparseable response: {text!r}")
+        except Exception as e:
+            print(f"[LLM WARNING] Query failed: {e}")
         return None
 
     # ── N-vote prior ──────────────────────────────────────────
@@ -257,6 +259,8 @@ class LLMActionPrior:
             if self.rate_limit_delay > 0:
                 time.sleep(self.rate_limit_delay)
 
+        self._valid_votes_history.append(valid_votes)
+
         # Laplace smoothing → avoid zero probabilities (KL would explode)
         eps = 0.01
         if valid_votes > 0:
@@ -288,6 +292,13 @@ class LLMActionPrior:
     @property
     def cache_hits(self):
         return self._cache_hits
+
+    @property
+    def valid_vote_rate(self):
+        """Average fraction of valid votes per LLM query (0~1)."""
+        if not self._valid_votes_history:
+            return 0.0
+        return float(np.mean(self._valid_votes_history)) / max(1, self.num_votes)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -395,7 +406,12 @@ class HesitationJokerPPOAgent:
         self.llm_prior = llm_prior
 
         # Statistics
-        self.gate_stats = {"total": 0, "active": 0}
+        self.gate_stats = {
+            "total": 0, "active": 0,
+            "h_values": [],        # continuous h(s) per step
+            "agreements": 0,       # LLM top action == agent action count
+            "llm_samples": 0,      # total gated steps with LLM response
+        }
 
     # ── Act (single step) ────────────────────────────────────
     @torch.no_grad()
@@ -425,8 +441,10 @@ class HesitationJokerPPOAgent:
         # Hesitation gate
         gate_val, h_val = self.gate(logits, mask)
         gate_active = bool(gate_val.item() > 0.5)
+        h_value = float(h_val.item())
 
         self.gate_stats["total"] += 1
+        self.gate_stats["h_values"].append(h_value)
 
         # Query LLM if gate is active
         p_llm = None
@@ -437,14 +455,23 @@ class HesitationJokerPPOAgent:
         # Sample from current policy (NOT LLM)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
+        a_int = int(action.item())
+
+        # Track LLM-agent agreement
+        if p_llm is not None:
+            llm_preferred = int(np.argmax(p_llm))
+            if llm_preferred == a_int:
+                self.gate_stats["agreements"] += 1
+            self.gate_stats["llm_samples"] += 1
 
         return (
-            int(action.item()),
+            a_int,
             float(dist.log_prob(action).item()),
             float(value.squeeze().item()),
             float(dist.entropy().item()),
             p_llm,
             gate_active,
+            h_value,
         )
 
     # ── Evaluate actions (batch, for training) ───────────────
@@ -589,6 +616,18 @@ class HesitationJokerPPOAgent:
             return 0.0
         return self.gate_stats["active"] / self.gate_stats["total"]
 
+    @property
+    def llm_agreement_rate(self):
+        if self.gate_stats["llm_samples"] == 0:
+            return 0.0
+        return self.gate_stats["agreements"] / self.gate_stats["llm_samples"]
+
+    @property
+    def avg_h_value(self):
+        if not self.gate_stats["h_values"]:
+            return 0.0
+        return float(np.mean(self.gate_stats["h_values"]))
+
 
 # ════════════════════════════════════════════════════════════════
 # 4. Training Loop
@@ -649,9 +688,11 @@ def train_joker_hesitation(
 
     # ── LLM prior ────────────────────────────────────────────
     llm_prior = None
-    if api_base and api_key:
+    if api_base:
+        # vLLM 本地部署不需要真实密钥，用占位符即可
+        actual_key = api_key if api_key else "EMPTY"
         llm_prior = LLMActionPrior(
-            api_base=api_base, api_key=api_key, model=llm_model,
+            api_base=api_base, api_key=actual_key, model=llm_model,
             num_votes=num_votes, temperature=llm_temperature,
             timeout=llm_timeout, rate_limit_delay=rate_limit_delay,
         )
@@ -692,8 +733,8 @@ def train_joker_hesitation(
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
         'episode', 'avg_score_7r', 'total_score', 'num_jokers',
-        'avg_score_50', 'gate_rate', 'llm_queries', 'cache_hits',
-        'avg_kl', 'alpha', 'joker_ids',
+        'avg_score_50', 'gate_rate', 'avg_h', 'llm_queries', 'cache_hits',
+        'avg_kl', 'alpha', 'llm_agree_rate', 'valid_vote_rate', 'joker_ids',
     ])
     csv_file.flush()
 
@@ -701,8 +742,11 @@ def train_joker_hesitation(
     ep_avg_scores = []
     ep_total_scores = []
     gate_rates = []
+    h_value_history = []      # avg h(s) per update cycle
     kl_values = []
     alpha_history = []
+    agreement_rates = []
+    valid_vote_rates = []
     updates_done = 0
 
     pbar = tqdm(total=total_episodes, desc="Hesitation Training", unit="ep", dynamic_ncols=True)
@@ -732,7 +776,7 @@ def train_joker_hesitation(
                 }
 
                 # Joker agent selects
-                action, logp, val, ent, p_llm, gate_active = agent.act(
+                action, logp, val, ent, p_llm, gate_active, h_val = agent.act(
                     joker_obs, joker_mask, env_state_dict
                 )
 
@@ -788,10 +832,13 @@ def train_joker_hesitation(
                 avg_kl = kl_values[-1] if kl_values else 0.0
                 csv_writer.writerow([
                     ep, avg_score, total_score, len(joint_env.held_jokers),
-                    avg_50, gate_rate,
+                    avg_50, gate_rate, agent.avg_h_value,
                     llm_prior.total_queries if llm_prior else 0,
                     llm_prior.cache_hits if llm_prior else 0,
-                    avg_kl, agent.alpha, str(joint_env.held_jokers),
+                    avg_kl, agent.alpha,
+                    agent.llm_agreement_rate,
+                    llm_prior.valid_vote_rate if llm_prior else 0.0,
+                    str(joint_env.held_jokers),
                 ])
                 csv_file.flush()
 
@@ -801,11 +848,14 @@ def train_joker_hesitation(
                 agent.scheduler.step()
                 updates_done += 1
 
-                # Track KL + alpha
+                # Track KL + alpha + new metrics
                 nb = max(1, log_info["n_batches"])
                 avg_kl_val = log_info["kl_loss"] / nb
                 kl_values.append(avg_kl_val)
                 alpha_history.append(agent.alpha)
+                h_value_history.append(agent.avg_h_value)
+                agreement_rates.append(agent.llm_agreement_rate)
+                valid_vote_rates.append(llm_prior.valid_vote_rate if llm_prior else 0.0)
 
                 # Reset trajectory
                 joker_traj = {
@@ -815,7 +865,10 @@ def train_joker_hesitation(
                 }
 
                 # Reset gate stats per update cycle
-                agent.gate_stats = {"total": 0, "active": 0}
+                agent.gate_stats = {
+                    "total": 0, "active": 0,
+                    "h_values": [], "agreements": 0, "llm_samples": 0,
+                }
 
             # Checkpoint
             if ep % checkpoint_interval == 0:
@@ -856,7 +909,7 @@ def train_joker_hesitation(
 
     # ── Plot training curves (2×2) ───────────────────────────
     if len(ep_avg_scores) > 0:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(3, 2, figsize=(14, 15))
         fig.suptitle(f'Hesitation-Gated LLM Prior — {run_name}', fontsize=14, fontweight='bold')
 
         window = min(100, max(5, len(ep_avg_scores) // 5))
@@ -910,6 +963,25 @@ def train_joker_hesitation(
             ax2.legend(loc='upper right')
         ax.set_xlabel('Update')
         ax.set_title('KL Divergence + Adaptive α'); ax.grid(True, ls='--', alpha=0.4)
+
+        # (2,0) h(s) over updates
+        ax = axes[2, 0]
+        if h_value_history:
+            ax.plot(np.arange(len(h_value_history)), h_value_history, lw=1.5, color='teal', label='Avg h(s)')
+            ax.axhline(y=agent.gate.tau, ls='--', color='red', lw=1, label=f'τ={agent.gate.tau}')
+            ax.set_xlabel('Update'); ax.set_ylabel('Avg h(s)')
+            ax.set_title('Hesitation h(s) Over Updates'); ax.grid(True, ls='--', alpha=0.4)
+            ax.set_ylim(-0.05, 1.05); ax.legend()
+
+        # (2,1) LLM agreement rate + valid vote rate
+        ax = axes[2, 1]
+        if agreement_rates:
+            ax.plot(np.arange(len(agreement_rates)), agreement_rates, lw=1.5, color='green', label='LLM Agree')
+        if valid_vote_rates:
+            ax.plot(np.arange(len(valid_vote_rates)), valid_vote_rates, lw=1.5, color='orange', label='Valid Vote')
+        ax.set_xlabel('Update'); ax.set_ylabel('Rate')
+        ax.set_title('LLM Agreement & Valid Vote Rate'); ax.set_ylim(-0.05, 1.05)
+        ax.grid(True, ls='--', alpha=0.4); ax.legend()
 
         plt.tight_layout()
         plot_path = f"outputs/hesitation/plots/{run_name}_curve.png"
@@ -989,8 +1061,8 @@ Examples:
     # LLM
     p.add_argument("--api_base", type=str, default="",
                    help="vLLM endpoint, e.g. http://localhost:8000/v1")
-    p.add_argument("--api_key", type=str, default="token-abc123",
-                   help="API key for vLLM endpoint")
+    p.add_argument("--api_key", type=str, default="",
+                   help="API key (vLLM 本地部署可不填，自动用占位符)")
     p.add_argument("--llm_model", type=str, default="Qwen/Qwen3-32B")
     p.add_argument("--num_votes", type=int, default=5,
                    help="N: number of LLM queries per state for voting")
