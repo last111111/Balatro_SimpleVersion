@@ -197,6 +197,8 @@ class CardLLMActionPrior:
             model=model_name,
             trust_remote_code=True,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=True,       # 避免 Colab CUDA graph 冲突
+            max_model_len=4096,       # 我们的 prompt 很短，不需要 40K
         )
         self.SamplingParams = SamplingParams
         self.sampling_params = SamplingParams(
