@@ -423,22 +423,38 @@ try:
 except ImportError:
     # Fallback: inline implementation if joker module not importable
     class HesitationGate:
-        """h(s) = Var(π)/σ²_max, gate when h < τ"""
-        def __init__(self, num_actions=2, tau=0.3):
-            self.num_actions = num_actions
-            self.tau = tau
-            self.sigma2_max = (num_actions - 1) / (num_actions ** 2)
+        """
+        Softmax variance gate on card selection logits (same as joker hesitation).
 
-        def compute_h(self, logits, action_mask):
-            masked_logits = logits + (1.0 - action_mask) * (-1e8)
-            probs = F.softmax(masked_logits, dim=-1)
-            mean_p = probs.mean(dim=-1, keepdim=True)
-            var_p = ((probs - mean_p) ** 2).mean(dim=-1)
-            h = var_p / max(self.sigma2_max, 1e-12)
+        h(s) = Var(softmax(logits_hand)) / σ²_max
+        h ≈ 0 → uniform over hand cards → uncertain → gate ON (query LLM)
+        h ≈ 1 → peaked on specific cards → confident → gate OFF
+
+        num_actions is dynamically set to hand size per call (typically 8).
+        """
+        def __init__(self, num_actions=8, tau=0.3):
+            self.tau = tau
+
+        def compute_h(self, card_logits, hand_mask):
+            """
+            card_logits: (B, 52) raw logits
+            hand_mask:   (B, 52) float — 1 for cards in hand
+            Returns h: (B,) in [0, 1]
+            """
+            # Mask out non-hand cards
+            masked_logits = card_logits + (1.0 - hand_mask) * (-1e8)
+            probs = F.softmax(masked_logits, dim=-1)          # (B, 52)
+            # Variance over all 52 dims (non-hand probs ≈ 0, contributes ~0)
+            n_hand = hand_mask.sum(dim=-1).clamp(min=1.0)     # (B,)
+            mean_p = (probs * hand_mask).sum(dim=-1, keepdim=True) / n_hand.unsqueeze(-1)
+            var_p = ((probs - mean_p) ** 2 * hand_mask).sum(dim=-1) / n_hand
+            # σ²_max = (n-1)/n² for n hand cards
+            sigma2_max = (n_hand - 1) / (n_hand ** 2)
+            h = var_p / sigma2_max.clamp(min=1e-12)
             return h.clamp(0.0, 1.0)
 
-        def __call__(self, logits, action_mask):
-            h = self.compute_h(logits, action_mask)
+        def __call__(self, card_logits, hand_mask):
+            h = self.compute_h(card_logits, hand_mask)
             gate = (h < self.tau).float()
             return gate, h
 
@@ -499,7 +515,7 @@ class HesitationCardPPOAgent:
         self.mask_ent_coef_end = 0.02
 
         # Hesitation gate + LLM prior
-        self.gate = HesitationGate(num_actions=2, tau=tau)
+        self.gate = HesitationGate(num_actions=max_hand_size, tau=tau)
         self.llm_prior = llm_prior
 
         # Statistics
@@ -530,29 +546,12 @@ class HesitationCardPPOAgent:
         if obs_np[209] < 0.01:
             logits_type[0, 0] = -1e8
 
-        # Hesitation gate on type head
-        type_mask = torch.ones((1, 2), device=self.device)
-        if obs_np[209] < 0.01:
-            type_mask[0, 0] = 0.0
-        gate_val, h_val = self.gate(logits_type, type_mask)
-        gate_active = bool(gate_val.item() > 0.5)
-        h_value = float(h_val.item())
-
-        self.gate_stats["total"] += 1
-        self.gate_stats["h_values"].append(h_value)
-
-        # Query LLM if gate active
-        p_llm_type, p_llm_card = None, None
-        if gate_active and self.llm_prior is not None and env is not None:
-            self.gate_stats["active"] += 1
-            p_llm_type, p_llm_card = self.llm_prior.get_prior(env)
-
-        # Sample type (from policy, NOT LLM)
+        # Sample type first (needed to pick play/discard subnet for gate)
         dist_type = torch.distributions.Categorical(logits=logits_type)
         a_type_t = dist_type.sample()
         a_type = int(a_type_t.item())
 
-        # Sample card mask
+        # Card mask
         hand_mask = torch.as_tensor(obs_np[:52], dtype=torch.float32, device=self.device).unsqueeze(0)
         hand_indices = torch.where(hand_mask[0] > 0.5)[0]
 
@@ -560,8 +559,16 @@ class HesitationCardPPOAgent:
             a_mask = [0] * 52
             logprob_mask = torch.zeros((1,), device=self.device)
             entropy_mask = torch.zeros((1,), device=self.device)
+            h_value = 1.0  # no cards → fully certain (no gate)
+            gate_active = False
         else:
             logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
+
+            # Hesitation gate on card selection logits
+            gate_val, h_val = self.gate(logits_active, hand_mask)
+            gate_active = bool(gate_val.item() > 0.5)
+            h_value = float(h_val.item())
+
             logits_valid = logits_active[:, hand_indices]
             dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
             sampled = dist_bern.sample()
@@ -576,6 +583,15 @@ class HesitationCardPPOAgent:
             a_mask = a_mask_52.squeeze(0).to(torch.int64).detach().cpu().tolist()
             logprob_mask = dist_bern.log_prob(sampled).sum(dim=1)
             entropy_mask = dist_bern.entropy().sum(dim=1)
+
+        self.gate_stats["total"] += 1
+        self.gate_stats["h_values"].append(h_value)
+
+        # Query LLM if gate active
+        p_llm_type, p_llm_card = None, None
+        if gate_active and self.llm_prior is not None and env is not None:
+            self.gate_stats["active"] += 1
+            p_llm_type, p_llm_card = self.llm_prior.get_prior(env)
 
         # Track LLM-agent agreement
         if p_llm_type is not None:
