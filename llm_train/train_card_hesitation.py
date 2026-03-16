@@ -1053,8 +1053,8 @@ def train_card_hesitation(
                 total_collected += 1
 
                 pbar.update(1)
+                gate_rate = agent.gate_activation_rate
                 if total_collected % 50 == 0 and len(ep_returns_train) > 0:
-                    gate_rate = agent.gate_activation_rate
                     recent5_plot = float(np.mean(ep_returns_plot[-5:])) if ep_returns_plot else 0.0
                     recent_pr = float(np.mean(ep_play_ratios[-5:])) if ep_play_ratios else 0.0
                     pbar.set_postfix({
