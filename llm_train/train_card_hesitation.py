@@ -1099,22 +1099,22 @@ def train_card_hesitation(
                     ep_play_count, ep_discard_count = 0, 0
                     obs = env.reset()
 
-            # ── Checkpoint ────────────────────────────────────
-            if total_collected - last_checkpoint_step >= checkpoint_interval:
-                ckpt_path = os.path.join(checkpoint_dir, f"{run_name}_step_{total_collected}.pt")
-                torch.save({
-                    "state_dict": agent.net.state_dict(),
-                    "optimizer": agent.opt.state_dict(),
-                    "step": total_collected,
-                    "episode": len(ep_returns_train),
-                    "config": {
-                        "obs_dim": obs_dim, "max_hand_size": max_hand_size,
-                        "max_play": max_play, "tau": tau, "alpha": agent.alpha,
-                        "shaping_beta": shaping_beta, "discard_cost": discard_cost,
-                    },
-                }, ckpt_path)
-                print(f"\n[Checkpoint] Saved to {ckpt_path}")
-                last_checkpoint_step = total_collected
+                # ── Checkpoint (per step check) ──────────────
+                if total_collected - last_checkpoint_step >= checkpoint_interval:
+                    ckpt_path = os.path.join(checkpoint_dir, f"{run_name}_step_{total_collected}.pt")
+                    torch.save({
+                        "state_dict": agent.net.state_dict(),
+                        "optimizer": agent.opt.state_dict(),
+                        "step": total_collected,
+                        "episode": len(ep_returns_train),
+                        "config": {
+                            "obs_dim": obs_dim, "max_hand_size": max_hand_size,
+                            "max_play": max_play, "tau": tau, "alpha": agent.alpha,
+                            "shaping_beta": shaping_beta, "discard_cost": discard_cost,
+                        },
+                    }, ckpt_path)
+                    print(f"\n[Checkpoint] Saved to {ckpt_path}")
+                    last_checkpoint_step = total_collected
 
             # ── PPO Update ────────────────────────────────────
             log_info = agent.update(traj)
