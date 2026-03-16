@@ -439,45 +439,42 @@ class CardLLMActionPrior:
 # 2. HesitationGate — 直接复用
 # ════════════════════════════════════════════════════════════════
 
-try:
-    from llm_train.train_joker_hesitation import HesitationGate
-except ImportError:
-    # Fallback: inline implementation if joker module not importable
-    class HesitationGate:
+# Card-specific HesitationGate (不复用 joker 版本，因为 card agent 的动作空间不同)
+class HesitationGate:
+    """
+    Softmax variance gate on card selection logits.
+
+    h(s) = Var(softmax(logits_hand)) / σ²_max
+    h ≈ 0 → uniform over hand cards → uncertain → gate ON (query LLM)
+    h ≈ 1 → peaked on specific cards → confident → gate OFF
+
+    num_actions is dynamically set to hand size per call (typically 8).
+    """
+    def __init__(self, num_actions=8, tau=0.3):
+        self.tau = tau
+
+    def compute_h(self, card_logits, hand_mask):
         """
-        Softmax variance gate on card selection logits (same as joker hesitation).
-
-        h(s) = Var(softmax(logits_hand)) / σ²_max
-        h ≈ 0 → uniform over hand cards → uncertain → gate ON (query LLM)
-        h ≈ 1 → peaked on specific cards → confident → gate OFF
-
-        num_actions is dynamically set to hand size per call (typically 8).
+        card_logits: (B, 52) raw logits
+        hand_mask:   (B, 52) float — 1 for cards in hand
+        Returns h: (B,) in [0, 1]
         """
-        def __init__(self, num_actions=8, tau=0.3):
-            self.tau = tau
+        # Mask out non-hand cards
+        masked_logits = card_logits + (1.0 - hand_mask) * (-1e8)
+        probs = F.softmax(masked_logits, dim=-1)          # (B, 52)
+        # Variance over all 52 dims (non-hand probs ≈ 0, contributes ~0)
+        n_hand = hand_mask.sum(dim=-1).clamp(min=1.0)     # (B,)
+        mean_p = (probs * hand_mask).sum(dim=-1, keepdim=True) / n_hand.unsqueeze(-1)
+        var_p = ((probs - mean_p) ** 2 * hand_mask).sum(dim=-1) / n_hand
+        # σ²_max = (n-1)/n² for n hand cards
+        sigma2_max = (n_hand - 1) / (n_hand ** 2)
+        h = var_p / sigma2_max.clamp(min=1e-12)
+        return h.clamp(0.0, 1.0)
 
-        def compute_h(self, card_logits, hand_mask):
-            """
-            card_logits: (B, 52) raw logits
-            hand_mask:   (B, 52) float — 1 for cards in hand
-            Returns h: (B,) in [0, 1]
-            """
-            # Mask out non-hand cards
-            masked_logits = card_logits + (1.0 - hand_mask) * (-1e8)
-            probs = F.softmax(masked_logits, dim=-1)          # (B, 52)
-            # Variance over all 52 dims (non-hand probs ≈ 0, contributes ~0)
-            n_hand = hand_mask.sum(dim=-1).clamp(min=1.0)     # (B,)
-            mean_p = (probs * hand_mask).sum(dim=-1, keepdim=True) / n_hand.unsqueeze(-1)
-            var_p = ((probs - mean_p) ** 2 * hand_mask).sum(dim=-1) / n_hand
-            # σ²_max = (n-1)/n² for n hand cards
-            sigma2_max = (n_hand - 1) / (n_hand ** 2)
-            h = var_p / sigma2_max.clamp(min=1e-12)
-            return h.clamp(0.0, 1.0)
-
-        def __call__(self, card_logits, hand_mask):
-            h = self.compute_h(card_logits, hand_mask)
-            gate = (h < self.tau).float()
-            return gate, h
+    def __call__(self, card_logits, hand_mask):
+        h = self.compute_h(card_logits, hand_mask)
+        gate = (h < self.tau).float()
+        return gate, h
 
 
 # ════════════════════════════════════════════════════════════════
