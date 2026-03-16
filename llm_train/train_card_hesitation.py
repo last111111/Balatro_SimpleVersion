@@ -202,10 +202,13 @@ class CardLLMActionPrior:
         self._cache_maxsize = cache_maxsize
         self._total_queries = 0
         self._cache_hits = 0
-        self._valid_votes_history = []  # valid votes per non-cached get_prior call
+        self._valid_votes_history = []  # valid votes per non-cached get_prior call (capped)
+        self._valid_votes_max = 500    # only keep last N for rolling average
 
         # JSONL logger for LLM responses
         self._llm_log_file = None
+        self._llm_log_count = 0
+        self._llm_log_flush_interval = 50  # flush every N entries
         if llm_log_path:
             os.makedirs(os.path.dirname(llm_log_path), exist_ok=True)
             self._llm_log_file = open(llm_log_path, 'a')
@@ -341,16 +344,31 @@ class CardLLMActionPrior:
         valid_votes = 0
         raw_responses = []
 
-        for _ in range(self.num_votes):
-            (action_type, card_indices), raw_text = self._query_single(prompt, hand)
-            self._total_queries += 1
-            raw_responses.append(raw_text)
+        # Batch all N votes into a single vLLM call
+        full_prompt = (
+            f"<|im_start|>system\n{LLM_SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        try:
+            batch_prompts = [full_prompt] * self.num_votes
+            outputs = self.llm.generate(batch_prompts, self.sampling_params)
+            self._total_queries += self.num_votes
 
-            if action_type is not None and card_indices:
-                type_counts[action_type] += 1
-                for ci in card_indices:
-                    card_counts[ci] += 1
-                valid_votes += 1
+            for out in outputs:
+                raw_text = out.outputs[0].text.strip()
+                raw_responses.append(raw_text)
+                action_type, card_idx = self._parse_response(raw_text, hand)
+                if action_type is not None and card_idx:
+                    type_counts[action_type] += 1
+                    for ci in card_idx:
+                        card_counts[ci] += 1
+                    valid_votes += 1
+                else:
+                    print(f"[LLM WARNING] Unparseable response: {raw_text!r}")
+        except Exception as e:
+            print(f"[LLM WARNING] Batch query failed: {e}")
+            self._total_queries += self.num_votes
 
         # Laplace smoothing for type prior
         eps_t = 0.01
@@ -375,6 +393,8 @@ class CardLLMActionPrior:
         p_card = np.clip(p_card, 0.01, 0.99)
 
         self._valid_votes_history.append(valid_votes)
+        if len(self._valid_votes_history) > self._valid_votes_max:
+            self._valid_votes_history = self._valid_votes_history[-self._valid_votes_max:]
 
         # Cache with LRU eviction
         result = (p_type, p_card)
@@ -382,19 +402,20 @@ class CardLLMActionPrior:
         if len(self._cache) > self._cache_maxsize:
             self._cache.popitem(last=False)
 
-        # Log LLM responses to JSONL
+        # Log LLM responses to JSONL (batched flush to reduce Drive I/O)
         if self._llm_log_file is not None:
             hand_strs = [_card_to_str(r, s) for r, s in hand]
             log_entry = {
                 "query_id": self._total_queries,
-                "prompt": prompt,
                 "responses": raw_responses,
                 "valid_votes": valid_votes,
                 "p_type": p_type.tolist(),
                 "hand": hand_strs,
             }
             self._llm_log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-            self._llm_log_file.flush()
+            self._llm_log_count += 1
+            if self._llm_log_count % self._llm_log_flush_interval == 0:
+                self._llm_log_file.flush()
 
         return result
 
@@ -521,7 +542,7 @@ class HesitationCardPPOAgent:
         # Statistics
         self.gate_stats = {
             "total": 0, "active": 0,
-            "h_values": [],        # continuous h(s) per step
+            "h_sum": 0.0, "h_count": 0,  # running average instead of list
             "agreements": 0,       # LLM type == agent type count
             "llm_samples": 0,      # total gated steps with LLM response
         }
@@ -556,7 +577,7 @@ class HesitationCardPPOAgent:
         hand_indices = torch.where(hand_mask[0] > 0.5)[0]
 
         if len(hand_indices) == 0:
-            a_mask = [0] * 52
+            a_mask = np.zeros(52, dtype=np.int64)
             logprob_mask = torch.zeros((1,), device=self.device)
             entropy_mask = torch.zeros((1,), device=self.device)
             h_value = 1.0  # no cards → fully certain (no gate)
@@ -580,18 +601,52 @@ class HesitationCardPPOAgent:
             a_mask_52 = torch.zeros((1, 52), dtype=torch.float32, device=self.device)
             a_mask_52[0, hand_indices] = sampled[0]
 
-            a_mask = a_mask_52.squeeze(0).to(torch.int64).detach().cpu().tolist()
+            a_mask = a_mask_52.squeeze(0).to(torch.int64).detach().cpu().numpy()
             logprob_mask = dist_bern.log_prob(sampled).sum(dim=1)
             entropy_mask = dist_bern.entropy().sum(dim=1)
 
         self.gate_stats["total"] += 1
-        self.gate_stats["h_values"].append(h_value)
+        self.gate_stats["h_sum"] += h_value
+        self.gate_stats["h_count"] += 1
 
         # Query LLM if gate active
         p_llm_type, p_llm_card = None, None
         if gate_active and self.llm_prior is not None and env is not None:
             self.gate_stats["active"] += 1
             p_llm_type, p_llm_card = self.llm_prior.get_prior(env)
+
+            # ── LLM action override: directly use LLM's action ──
+            if p_llm_type is not None:
+                llm_type = int(np.argmax(p_llm_type))
+                # Respect H7: can't discard if discard_count=0
+                if llm_type == 0 and obs_np[209] < 0.01:
+                    llm_type = 1
+                a_type = llm_type
+                a_type_t = torch.tensor([a_type], device=self.device)
+
+                # Use LLM's card prior: pick cards with p > 0.5
+                if len(hand_indices) > 0:
+                    llm_card_mask = (p_llm_card > 0.5).astype(np.float32)
+                    # Fallback: if LLM selected nothing, pick top card
+                    if llm_card_mask.sum() < 1 and a_type == 1:
+                        llm_card_mask[np.argmax(p_llm_card)] = 1.0
+                    a_mask = llm_card_mask.astype(np.int64)
+
+                    # Recompute logprob under PPO policy for the LLM-chosen action
+                    logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
+                    logits_valid = logits_active[:, hand_indices]
+                    dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
+                    hand_idx_cpu = hand_indices.cpu().numpy()
+                    chosen = torch.as_tensor(
+                        a_mask[hand_idx_cpu],
+                        dtype=torch.float32, device=self.device
+                    ).unsqueeze(0)
+                    logprob_mask = dist_bern.log_prob(chosen).sum(dim=1)
+                    entropy_mask = dist_bern.entropy().sum(dim=1)
+
+                # Recompute type logprob
+                dist_type = torch.distributions.Categorical(logits=logits_type)
+                logprob_type_override = dist_type.log_prob(a_type_t)
 
         # Track LLM-agent agreement
         if p_llm_type is not None:
@@ -796,9 +851,9 @@ class HesitationCardPPOAgent:
 
     @property
     def avg_h_value(self):
-        if not self.gate_stats["h_values"]:
+        if self.gate_stats["h_count"] == 0:
             return 0.0
-        return float(np.mean(self.gate_stats["h_values"]))
+        return self.gate_stats["h_sum"] / self.gate_stats["h_count"]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1001,8 +1056,8 @@ def train_card_hesitation(
                 total_collected += 1
 
                 pbar.update(1)
-                gate_rate = agent.gate_activation_rate
-                if len(ep_returns_train) > 0:
+                if total_collected % 50 == 0 and len(ep_returns_train) > 0:
+                    gate_rate = agent.gate_activation_rate
                     recent5_plot = float(np.mean(ep_returns_plot[-5:])) if ep_returns_plot else 0.0
                     recent_pr = float(np.mean(ep_play_ratios[-5:])) if ep_play_ratios else 0.0
                     pbar.set_postfix({
@@ -1039,7 +1094,8 @@ def train_card_hesitation(
                             llm_prior.total_queries if llm_prior else 0,
                             llm_prior.cache_hits if llm_prior else 0,
                         ])
-                        csv_file.flush()
+                        if len(ep_returns_train) % (log_interval * 10) == 0:
+                            csv_file.flush()  # flush every 1000 episodes to reduce Drive I/O
 
                     ep_ret_train = 0.0
                     ep_ret_plot = 0.0
@@ -1086,7 +1142,7 @@ def train_card_hesitation(
             # Reset gate stats per update cycle
             agent.gate_stats = {
                 "total": 0, "active": 0,
-                "h_values": [], "agreements": 0, "llm_samples": 0,
+                "h_sum": 0.0, "h_count": 0, "agreements": 0, "llm_samples": 0,
             }
 
         pbar.close()
