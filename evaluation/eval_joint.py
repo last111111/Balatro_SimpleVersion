@@ -10,7 +10,10 @@ import argparse
 import torch
 import numpy as np
 
-from models.card_agent import ActorCritic
+from models.card_agent import (
+    ActorCritic, NUM_COMBOS, NUM_ACTIONS,
+    combo_idx_to_card_mask, get_valid_action_mask,
+)
 from models.joker_agent import JokerSelectNet
 from envs.joint_env import JointEnv
 from utils.visualization import GameVisualizer
@@ -126,7 +129,7 @@ def evaluate_joint(checkpoint_path=None, num_episodes=3, render=True, seed=None)
 
 
 class _CardAgentWrapper:
-    """将 ActorCritic model 包装成和 PPOAgent 相同的 .act() 接口"""
+    """将 ActorCritic model 包装成和 PPOAgent 相同的 .act() 接口 (Categorical 436)"""
 
     def __init__(self, model, device):
         self.model = model
@@ -135,44 +138,25 @@ class _CardAgentWrapper:
     @torch.no_grad()
     def act(self, obs_np):
         x = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits_type, logits_sel_play, logits_sel_dis, value = self.model(x)
+        action_logits, value = self.model(x)
 
-        # H7
-        if obs_np[209] < 0.01:
-            logits_type[0, 0] = -1e8
+        # Build valid action mask
+        hand_indices = list(np.where(obs_np[:52] > 0.5)[0])
+        hand_size = len(hand_indices)
+        can_discard = obs_np[209] >= 0.01
+        valid_mask = get_valid_action_mask(hand_size, can_discard, device=self.device)
 
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        a_type = int(dist_type.sample().item())
+        action_logits[0, ~valid_mask] = -1e8
 
-        hand_mask = torch.as_tensor(obs_np[:52], dtype=torch.float32, device=self.device).unsqueeze(0)
-        hand_indices = torch.where(hand_mask[0] > 0.5)[0]
+        dist = torch.distributions.Categorical(logits=action_logits[0])
+        combo_idx_t = dist.sample()
+        combo_idx = int(combo_idx_t.item())
+        logprob = float(dist.log_prob(combo_idx_t).item())
 
-        if len(hand_indices) == 0:
-            a_mask = [0] * 52
-            logprob_mask = 0.0
-        else:
-            logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
-            logits_valid = logits_active[:, hand_indices]
-
-            # 确定性：sigmoid > 0.5
-            probs = torch.sigmoid(logits_valid)
-            sampled = (probs > 0.5).float()
-
-            if a_type == 1 and sampled.sum() < 1:
-                idx = torch.argmax(logits_valid, dim=1)
-                sampled[0, idx] = 1.0
-
-            a_mask_52 = torch.zeros((1, 52), dtype=torch.float32, device=self.device)
-            a_mask_52[0, hand_indices] = sampled[0]
-            a_mask = a_mask_52.squeeze(0).to(torch.int64).tolist()
-
-            dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
-            logprob_mask = float(dist_bern.log_prob(sampled).sum().item())
-
-        logprob_type = float(dist_type.log_prob(torch.tensor(a_type)).item())
+        a_type, a_mask = combo_idx_to_card_mask(combo_idx, hand_indices)
         val = float(value.squeeze().item())
 
-        return a_type, a_mask, logprob_type, logprob_mask, val, 0.0
+        return a_type, a_mask, combo_idx, logprob, val, 0.0
 
 
 def main():

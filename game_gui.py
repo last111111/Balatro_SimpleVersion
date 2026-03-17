@@ -713,7 +713,7 @@ class BalatroGUI:
             env = self.joint_env.card_env
             obs = env._get_observation()
 
-            a_type, a_mask, _, _, _, _ = self.card_wrapper.act(obs)
+            a_type, a_mask, _combo_idx, _logp, _val, _ = self.card_wrapper.act(obs)
 
             # 硬约束：弃牌次数用完时强制出牌（与 env 的 H7 逻辑一致）
             if a_type == 0 and env.discard_count <= 0:

@@ -10,7 +10,10 @@ import argparse
 import torch
 import numpy as np
 from envs.BalatroEnv import BalatroEnv
-from models.card_agent import ActorCritic
+from models.card_agent import (
+    ActorCritic, NUM_COMBOS, NUM_ACTIONS,
+    combo_idx_to_card_mask, get_valid_action_mask,
+)
 from utils.visualization import GameVisualizer
 
 
@@ -99,34 +102,19 @@ def evaluate_model(checkpoint_path=None, num_episodes=5, render=True, seed=None)
 
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                logits_type, logits_sel_play, logits_sel_dis, value = model(obs_tensor)
+                action_logits, value = model(obs_tensor)
 
-                # H7: 弃牌次数为 0 时 mask 弃牌选项
-                if obs[209] < 0.01:
-                    logits_type[0, 0] = -1e8
+                # Build valid action mask
+                hand_indices = list(np.where(obs[:52] > 0.5)[0])
+                hand_size = len(hand_indices)
+                can_discard = obs[209] >= 0.01
+                valid_mask = get_valid_action_mask(hand_size, can_discard, device=device)
 
-                dist_type = torch.distributions.Categorical(logits=logits_type)
-                action_type = int(dist_type.sample().item())
+                action_logits[0, ~valid_mask] = -1e8
 
-                hand_mask = torch.as_tensor(obs[:52], dtype=torch.float32, device=device).unsqueeze(0)
-                hand_indices = torch.where(hand_mask[0] > 0.5)[0]
-
-                if len(hand_indices) == 0:
-                    action_mask = [0] * 52
-                else:
-                    logits_active = logits_sel_play if action_type == 1 else logits_sel_dis
-                    logits_valid = logits_active[:, hand_indices]
-
-                    probs = torch.sigmoid(logits_valid)
-                    sampled = (probs > 0.5).float()
-
-                    if action_type == 1 and sampled.sum() < 1:
-                        idx = torch.argmax(logits_valid, dim=1)
-                        sampled[0, idx] = 1.0
-
-                    action_mask_52 = torch.zeros((1, 52), dtype=torch.float32, device=device)
-                    action_mask_52[0, hand_indices] = sampled[0]
-                    action_mask = action_mask_52.squeeze(0).to(torch.int64).tolist()
+                # Deterministic: argmax for evaluation
+                combo_idx = int(action_logits[0].argmax().item())
+                action_type, action_mask = combo_idx_to_card_mask(combo_idx, hand_indices)
 
             selected_cards = []
             current_hand = env.hand.copy()
@@ -134,9 +122,6 @@ def evaluate_model(checkpoint_path=None, num_episodes=5, render=True, seed=None)
                 card_idx = env._card_index(card)
                 if card_idx < len(action_mask) and action_mask[card_idx] == 1:
                     selected_cards.append(card)
-
-            if action_type == 1 and len(selected_cards) > 5:
-                selected_cards = selected_cards[:5]
 
             next_obs, reward, done, info = env.step((action_type, action_mask))
             total_reward += reward

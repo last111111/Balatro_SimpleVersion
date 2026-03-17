@@ -110,8 +110,8 @@ def train_joint(total_episodes=5000,
     ep_avg_scores = []         # 每个 episode 的平均每轮得分
     joker_updates_done = 0
     card_steps_collected = 0
-    card_traj_buffer = {"obs": [], "a_type": [], "a_mask": [],
-                        "logp_type": [], "logp_mask": [],
+    card_traj_buffer = {"obs": [], "combo_idx": [],
+                        "logp": [],
                         "val": [], "rew": [], "done": []}
 
     pbar = tqdm(total=total_episodes, desc="Joint Training", unit="ep", dynamic_ncols=True)
@@ -189,8 +189,8 @@ def train_joint(total_episodes=5000,
             if card_steps_collected >= card_update_steps:
                 card_agent.update(card_traj_buffer)
                 card_agent.scheduler.step()
-                card_traj_buffer = {"obs": [], "a_type": [], "a_mask": [],
-                                    "logp_type": [], "logp_mask": [],
+                card_traj_buffer = {"obs": [], "combo_idx": [],
+                                    "logp": [],
                                     "val": [], "rew": [], "done": []}
                 card_steps_collected = 0
 

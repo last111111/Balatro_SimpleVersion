@@ -1,6 +1,6 @@
 # training/train_card.py
 # -*- coding: utf-8 -*-
-"""PPOAgent + 打牌训练循环"""
+"""PPOAgent + 打牌训练循环 (Categorical 436-dim action space)"""
 
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -14,9 +14,17 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
-from models.card_agent import ActorCritic
+from models.card_agent import (
+    ActorCritic, NUM_COMBOS, NUM_ACTIONS, COMBO_TABLE, COMBO_MAX_POS,
+    combo_idx_to_card_mask, get_valid_action_mask,
+)
 from training.ppo_utils import get_device, set_seed, smooth_curve, gae
 from envs.BalatroEnv import BalatroEnv
+
+
+def _get_hand_indices(obs_np):
+    """Extract sorted list of 52-dim card indices that are in hand."""
+    return list(np.where(obs_np[:52] > 0.5)[0])
 
 
 class PPOAgent:
@@ -40,96 +48,79 @@ class PPOAgent:
         cosine_sched = CosineAnnealingLR(self.opt, T_max=max(1, total_updates - warmup_steps), eta_min=lr * 0.1)
         self.scheduler = SequentialLR(self.opt, [warmup_sched, cosine_sched], milestones=[warmup_steps])
 
-        # 弃牌 mask 的损失系数（H3）
-        self.coef_sel_dis = 0.3
-        self.coef_sel_dis_target = 0.80
-
-        # H5: mask 熵系数
-        self.mask_ent_coef = 0.1
-        self.mask_ent_coef_start = 0.1
-        self.mask_ent_coef_end = 0.02
-
     @torch.no_grad()
     def act(self, obs_np):
         self.net.eval()
         x = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits_type, logits_sel_play, logits_sel_dis, value = self.net(x)
+        action_logits, value = self.net(x)
 
-        # H7: 弃牌次数为 0 时 mask 弃牌选项
-        if obs_np[209] < 0.01:
-            logits_type[0, 0] = -1e8
+        # Build valid action mask
+        hand_indices = _get_hand_indices(obs_np)
+        hand_size = len(hand_indices)
+        can_discard = obs_np[209] >= 0.01
+        valid_mask = get_valid_action_mask(hand_size, can_discard, device=self.device)
 
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        a_type_t = dist_type.sample()
-        a_type = int(a_type_t.item())
+        # Mask invalid actions
+        action_logits[0, ~valid_mask] = -1e8
 
-        hand_mask = torch.as_tensor(obs_np[:52], dtype=torch.float32, device=self.device).unsqueeze(0)
-        hand_indices = torch.where(hand_mask[0] > 0.5)[0]
+        dist = torch.distributions.Categorical(logits=action_logits[0])
+        combo_idx_t = dist.sample()
+        combo_idx = int(combo_idx_t.item())
 
-        if len(hand_indices) == 0:
-            a_mask = torch.zeros((1, 52), dtype=torch.int64, device=self.device)
-            logprob_mask = torch.zeros((1,), device=self.device)
-            entropy_mask = torch.zeros((1,), device=self.device)
-        else:
-            logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
-            logits_valid = logits_active[:, hand_indices]
-            dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
-            sampled = dist_bern.sample()
+        logprob = dist.log_prob(combo_idx_t)
+        entropy = dist.entropy()
 
-            if a_type == 1 and sampled.sum() < 1:
-                idx = torch.argmax(logits_valid, dim=1)
-                sampled[0, idx] = 1.0
+        # Convert to env action
+        a_type, card_mask_52 = combo_idx_to_card_mask(combo_idx, hand_indices)
 
-            a_mask_52 = torch.zeros((1, 52), dtype=torch.float32, device=self.device)
-            a_mask_52[0, hand_indices] = sampled[0]
-
-            a_mask = a_mask_52.squeeze(0).to(torch.int64).detach().cpu().tolist()
-            logprob_mask = dist_bern.log_prob(sampled).sum(dim=1)
-            entropy_mask = dist_bern.entropy().sum(dim=1)
-
-        logprob_type = dist_type.log_prob(a_type_t)
-        entropy_type = dist_type.entropy()
-        total_entropy = entropy_type + entropy_mask
         value = value.squeeze(0)
 
         return (
-            a_type, a_mask,
-            float(logprob_type.item()), float(logprob_mask.item()),
-            float(value.item()), float(total_entropy.item())
+            a_type, card_mask_52, combo_idx,
+            float(logprob.item()),
+            float(value.item()), float(entropy.item())
         )
 
-    def evaluate_actions(self, obs_b, a_type_b, a_mask_b):
-        logits_type, logits_sel_play, logits_sel_dis, values = self.net(obs_b)
+    def evaluate_actions(self, obs_b, combo_idx_b):
+        """
+        Evaluate actions in batch.
 
-        # H7
-        no_discard = obs_b[:, 209] < 0.01
-        logits_type[no_discard, 0] = -1e8
+        Args:
+            obs_b: (N, obs_dim) observations
+            combo_idx_b: (N,) combo indices (0..435)
 
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        logprob_type = dist_type.log_prob(a_type_b)
-        entropy_type = dist_type.entropy()
+        Returns:
+            logprob: (N,)
+            values: (N,)
+            entropy: (N,)
+        """
+        action_logits, values = self.net(obs_b)
 
-        hand_mask = obs_b[:, :52]
-        is_play = (a_type_b == 1).unsqueeze(1)
-        logits_active = torch.where(is_play, logits_sel_play, logits_sel_dis)
+        # Build valid masks for entire batch
+        hand_sizes = obs_b[:, :52].sum(dim=1).long()  # (N,)
+        can_discard = obs_b[:, 209] >= 0.01  # (N,)
 
-        logits_masked = logits_active.clone()
-        logits_masked[hand_mask < 0.5] = -1e8
+        cmp = COMBO_MAX_POS.to(self.device)  # (218,) — precomputed, just move to device
+        play_valid = cmp.unsqueeze(0) < hand_sizes.unsqueeze(1)  # (N, 218)
+        discard_valid = play_valid & can_discard.unsqueeze(1)  # (N, 218)
+        valid_mask = torch.cat([play_valid, discard_valid], dim=1)  # (N, 436)
 
-        dist_bern = torch.distributions.Bernoulli(logits=logits_masked)
-        logprob_mask = (dist_bern.log_prob(a_mask_b.float()) * hand_mask).sum(dim=1)
-        entropy_mask = (dist_bern.entropy() * hand_mask).sum(dim=1)
+        # Clone to avoid in-place mutation of forward output (breaks autograd)
+        masked_logits = action_logits.clone()
+        masked_logits[~valid_mask] = -1e8
 
-        return logprob_type, logprob_mask, values, entropy_type, entropy_mask
+        dist = torch.distributions.Categorical(logits=masked_logits)
+        logprob = dist.log_prob(combo_idx_b)
+        entropy = dist.entropy()
+
+        return logprob, values, entropy
 
     def update(self, traj):
         obs = torch.as_tensor(np.array(traj["obs"]), dtype=torch.float32, device=self.device)
-        a_type = torch.as_tensor(np.array(traj["a_type"]), dtype=torch.long, device=self.device)
-        a_mask = torch.as_tensor(np.array(traj["a_mask"]), dtype=torch.long, device=self.device)
+        combo_idx = torch.as_tensor(np.array(traj["combo_idx"]), dtype=torch.long, device=self.device)
 
         with torch.no_grad():
-            old_logp_type = torch.as_tensor(np.array(traj["logp_type"]), dtype=torch.float32, device=self.device)
-            old_logp_mask = torch.as_tensor(np.array(traj["logp_mask"]), dtype=torch.float32, device=self.device)
+            old_logp = torch.as_tensor(np.array(traj["logp"]), dtype=torch.float32, device=self.device)
             values = torch.as_tensor(np.array(traj["val"]), dtype=torch.float32, device=self.device)
             rewards = np.array(traj["rew"], dtype=np.float32)
             dones = np.array(traj["done"], dtype=np.float32)
@@ -148,41 +139,24 @@ class PPOAgent:
             np.random.shuffle(idx)
             for s in range(0, N, self.mb_size):
                 mb = idx[s:s + self.mb_size]
-                mb_obs, mb_type, mb_mask = obs[mb], a_type[mb], a_mask[mb]
-                mb_old_logp_type = old_logp_type[mb]
-                mb_old_logp_mask = old_logp_mask[mb]
+                mb_obs = obs[mb]
+                mb_combo = combo_idx[mb]
+                mb_old_logp = old_logp[mb]
                 mb_ret, mb_adv = returns[mb], advantages[mb]
                 mb_old_v = values[mb].detach()
 
-                new_logp_type, new_logp_mask, new_v, ent_type, ent_mask = self.evaluate_actions(
-                    mb_obs, mb_type, mb_mask
-                )
+                new_logp, new_v, ent = self.evaluate_actions(mb_obs, mb_combo)
 
-                ratio_type = torch.exp(new_logp_type - mb_old_logp_type)
-                unclipped_t = -ratio_type * mb_adv
-                clipped_t = -torch.clamp(ratio_type, 1 - self.clip, 1 + self.clip) * mb_adv
-                pol_loss_type = torch.max(unclipped_t, clipped_t).mean()
-
-                ratio_mask = torch.exp(new_logp_mask - mb_old_logp_mask)
-                unclipped_m = -ratio_mask * mb_adv
-                clipped_m = -torch.clamp(ratio_mask, 1 - self.clip, 1 + self.clip) * mb_adv
-                per_sample_m = torch.max(unclipped_m, clipped_m)
-
-                m_play = (mb_type == 1)
-                m_dis = (mb_type == 0)
-
-                pol_loss_mask_play = per_sample_m[m_play].mean() if m_play.any() else torch.tensor(0.0, device=self.device)
-                pol_loss_mask_dis = per_sample_m[m_dis].mean() if m_dis.any() else torch.tensor(0.0, device=self.device)
-
-                pol_loss = pol_loss_type + 1.0 * pol_loss_mask_play + self.coef_sel_dis * pol_loss_mask_dis
+                ratio = torch.exp(new_logp - mb_old_logp)
+                unclipped = -ratio * mb_adv
+                clipped = -torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * mb_adv
+                pol_loss = torch.max(unclipped, clipped).mean()
 
                 vclip = 0.2
                 v_clipped = mb_old_v + torch.clamp(new_v - mb_old_v, -vclip, vclip)
                 v_loss = torch.max((new_v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
 
-                ent = ent_type.mean() + self.mask_ent_coef * ent_mask.mean()
-
-                loss = pol_loss + self.vcoef * v_loss - self.ecoef * ent
+                loss = pol_loss + self.vcoef * v_loss - self.ecoef * ent.mean()
                 if not torch.isfinite(loss):
                     self.opt.zero_grad()
                     continue
@@ -223,6 +197,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
     print(f"[Init] Run name: {run_name}")
     print(f"[Init] Checkpoint dir: {checkpoint_dir}")
     print(f"[Init] Log path: {log_path}")
+    print(f"[Init] Action space: Categorical({NUM_ACTIONS}) (play={NUM_COMBOS} + discard={NUM_COMBOS})")
 
     env = BalatroEnv(max_hand_size=max_hand_size, max_play=max_play, shaping_beta=shaping_beta, discard_cost=discard_cost)
     obs = env.reset()
@@ -238,15 +213,6 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
         frac = min(1.0, updates_done / max(1, total_updates))
         return float(ecoef_start + (ecoef_end - ecoef_start) * frac)
 
-    def anneal_coef_dis():
-        warmup_frac = 0.1
-        frac = min(1.0, updates_done / max(1, int(total_updates * warmup_frac)))
-        return float(0.3 + (agent.coef_sel_dis_target - 0.3) * frac)
-
-    def anneal_mask_ent_coef():
-        frac = min(1.0, updates_done / max(1, total_updates))
-        return float(agent.mask_ent_coef_start + (agent.mask_ent_coef_end - agent.mask_ent_coef_start) * frac)
-
     ep_returns_train, ep_ret_train = [], 0.0
     ep_returns_plot, ep_ret_plot = [], 0.0
     ep_actual_scores = []
@@ -256,7 +222,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
     csv_file = open(log_path, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow(['episode', 'steps', 'return_train', 'return_plot', 'actual_score',
-                         'avg_train_100', 'avg_plot_100', 'avg_score_100', 'max_plot', 'ecoef', 'coef_dis', 'play_ratio'])
+                         'avg_train_100', 'avg_plot_100', 'avg_score_100', 'max_plot', 'ecoef', 'play_ratio'])
     csv_file.flush()
 
     total_collected = 0
@@ -265,19 +231,17 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
 
     try:
         while total_collected < total_steps:
-            traj = {"obs": [], "a_type": [], "a_mask": [],
-                    "logp_type": [], "logp_mask": [],
+            traj = {"obs": [], "combo_idx": [],
+                    "logp": [],
                     "val": [], "rew": [], "done": []}
             steps = 0
             while steps < update_steps and total_collected < total_steps:
-                a_type_val, a_mask_val, logp_type, logp_mask, val, _ = agent.act(obs)
+                a_type_val, a_mask_val, combo_idx, logp, val, _ = agent.act(obs)
                 next_obs, reward, done, _ = env.step((a_type_val, a_mask_val))
 
                 traj["obs"].append(obs)
-                traj["a_type"].append(a_type_val)
-                traj["a_mask"].append(a_mask_val)
-                traj["logp_type"].append(logp_type)
-                traj["logp_mask"].append(logp_mask)
+                traj["combo_idx"].append(combo_idx)
+                traj["logp"].append(logp)
                 traj["val"].append(val)
                 traj["rew"].append(reward)
                 traj["done"].append(done)
@@ -306,7 +270,6 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
                         "ret_train": f"{ep_ret_train:.1f}",
                         "ret_plot": f"{ep_ret_plot:.1f}",
                         "ecoef": f"{agent.ecoef:.3f}",
-                        "coef_dis": f"{agent.coef_sel_dis:.3f}",
                     })
                 else:
                     pbar.set_postfix({
@@ -314,7 +277,6 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
                         "ret_train": f"{ep_ret_train:.1f}",
                         "ret_plot": f"{ep_ret_plot:.1f}",
                         "ecoef": f"{agent.ecoef:.3f}",
-                        "coef_dis": f"{agent.coef_sel_dis:.3f}",
                     })
 
                 if done:
@@ -335,7 +297,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
                             len(ep_returns_train), total_collected,
                             ep_ret_train, ep_ret_plot, env.cumulative_score,
                             avg_train_100, avg_plot_100, avg_score_100, max_plot,
-                            agent.ecoef, agent.coef_sel_dis, play_ratio
+                            agent.ecoef, play_ratio
                         ])
                         csv_file.flush()
 
@@ -359,6 +321,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
                         "ecoef_start": ecoef_start, "ecoef_end": ecoef_end,
                         "shaping_beta": shaping_beta,
                         "discard_cost": discard_cost,
+                        "action_space": "categorical_436",
                     }
                 }
                 torch.save(pkg, checkpoint_path)
@@ -369,8 +332,6 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
 
             updates_done += 1
             agent.ecoef = anneal_ecoef()
-            agent.coef_sel_dis = anneal_coef_dis()
-            agent.mask_ent_coef = anneal_mask_ent_coef()
             agent.scheduler.step()
 
         pbar.close()
@@ -397,6 +358,7 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
             "ecoef_start": ecoef_start, "ecoef_end": ecoef_end,
             "shaping_beta": shaping_beta,
             "discard_cost": discard_cost,
+            "action_space": "categorical_436",
         }
     }
     torch.save(pkg, final_model_path)

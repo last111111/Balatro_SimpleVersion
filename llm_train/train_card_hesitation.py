@@ -4,10 +4,10 @@
 Hesitation-Gated LLM Prior for Card Play/Discard PPO
 =====================================================
 
-Paper Eq. 4-6 implementation for card agent:
+Paper Eq. 4-6 implementation for card agent (Categorical 436-dim action space):
   - LLM Action Prior: N-vote empirical distribution via vLLM (local)
-  - Hesitation Gate: g(s) = 1 if h(s) < τ (uncertain → query LLM)
-  - Modified PPO loss: L = clip + vcoef*v_loss - ecoef*H + α*g*(KL_type + KL_card)
+  - Hesitation Gate: g(s) = 1 if h(s) < tau (uncertain -> query LLM)
+  - Modified PPO loss: L = clip + vcoef*v_loss - ecoef*H + alpha*g*KL(pi||p_LLM)
 
 LLM: Qwen3-32B via vLLM (本地加载，不需要 API server)
 Colab A100 quick start:
@@ -49,7 +49,10 @@ _ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from models.card_agent import ActorCritic
+from models.card_agent import (
+    ActorCritic, NUM_COMBOS, NUM_ACTIONS, COMBO_TABLE, COMBO_MAX_POS,
+    combo_idx_to_card_mask, get_valid_action_mask,
+)
 from training.ppo_utils import get_device, set_seed, smooth_curve, gae
 from envs.BalatroEnv import BalatroEnv
 
@@ -59,42 +62,40 @@ if 'google.colab' in sys.modules:
 
 RANK_NAMES = {1: 'A', 2: '2', 3: '3', 4: '4', 5: '5', 6: '6', 7: '7',
               8: '8', 9: '9', 10: '10', 11: 'J', 12: 'Q', 13: 'K'}
-SUIT_SYMBOLS = {'H': '♥', 'D': '♦', 'C': '♣', 'S': '♠'}
+SUIT_SYMBOLS = {'H': '\u2665', 'D': '\u2666', 'C': '\u2663', 'S': '\u2660'}
 SUIT_LIST = ['H', 'D', 'C', 'S']
 
 
 # ════════════════════════════════════════════════════════════════
-# Helper: card ↔ string conversion
+# Helper: card <-> string conversion
 # ════════════════════════════════════════════════════════════════
 
 def _card_to_str(rank, suit):
-    """(rank, suit) → 'A♠', '10♥' etc."""
+    """(rank, suit) -> 'A\u2660', '10\u2665' etc."""
     return f"{RANK_NAMES[rank]}{SUIT_SYMBOLS[suit]}"
 
 
 def _index_to_card(idx):
-    """0-51 index → (rank, suit)"""
+    """0-51 index -> (rank, suit)"""
     rank = idx // 4 + 1
     suit = SUIT_LIST[idx % 4]
     return (rank, suit)
 
 
 def _card_index(rank, suit):
-    """(rank, suit) → 0-51 index"""
+    """(rank, suit) -> 0-51 index"""
     suit_map = {'H': 0, 'D': 1, 'C': 2, 'S': 3}
     return (rank - 1) * 4 + suit_map[suit]
 
 
 def _parse_card_str(s):
-    """Parse 'A♠' → (rank, suit) or None"""
+    """Parse 'A\u2660' -> (rank, suit) or None"""
     s = s.strip()
     if not s:
         return None
-    # Map symbols back to letters
-    sym_to_suit = {'♥': 'H', '♦': 'D', '♣': 'C', '♠': 'S',
+    sym_to_suit = {'\u2665': 'H', '\u2666': 'D', '\u2663': 'C', '\u2660': 'S',
                    'H': 'H', 'D': 'D', 'C': 'C', 'S': 'S'}
     name_to_rank = {'A': 1, 'J': 11, 'Q': 12, 'K': 13}
-    # Last char is suit
     suit_char = s[-1]
     suit = sym_to_suit.get(suit_char)
     if suit is None:
@@ -109,8 +110,42 @@ def _parse_card_str(s):
     return (rank, suit)
 
 
+def _get_hand_indices(obs_np):
+    """Extract sorted list of 52-dim card indices that are in hand."""
+    return list(np.where(obs_np[:52] > 0.5)[0])
+
+
+def _card_selection_to_combo_idx(a_type, card_indices_52, hand_indices_52):
+    """
+    Map LLM's (action_type, selected_card_indices) to a combo_idx (0..435).
+
+    Args:
+        a_type: int, 0=discard, 1=play
+        card_indices_52: list of int, selected card indices in 52-dim space
+        hand_indices_52: list of int, hand card indices in 52-dim space (ordered)
+
+    Returns:
+        combo_idx: int (0..435) or None if no match
+    """
+    # Convert 52-dim indices to hand positions (0..7)
+    idx_to_pos = {ci: pos for pos, ci in enumerate(hand_indices_52)}
+    positions = sorted([idx_to_pos[ci] for ci in card_indices_52 if ci in idx_to_pos])
+    if not positions:
+        return None
+    positions_tuple = tuple(positions)
+
+    # Find in COMBO_TABLE
+    for i, combo in enumerate(COMBO_TABLE):
+        if combo == positions_tuple:
+            if a_type == 1:
+                return i  # play
+            else:
+                return i + NUM_COMBOS  # discard
+    return None
+
+
 # ════════════════════════════════════════════════════════════════
-# 1. CardLLMActionPrior — 本地 vLLM 推理
+# 1. CardLLMActionPrior -- 本地 vLLM 推理
 # ════════════════════════════════════════════════════════════════
 
 LLM_SYSTEM_PROMPT = """\
@@ -120,22 +155,22 @@ or
 DISCARD card1 card2 ...
 
 Game rules:
-- Standard 52-card deck (ranks A,2-10,J,Q,K; suits ♥♦♣♠). You hold 8 cards.
+- Standard 52-card deck (ranks A,2-10,J,Q,K; suits \u2665\u2666\u2663\u2660). You hold 8 cards.
 - Each round you have 5 play actions and 3 discard actions.
-- PLAY: select 1-5 cards from your hand to score. Score = base_chips × base_mult + card chip bonuses.
+- PLAY: select 1-5 cards from your hand to score. Score = base_chips x base_mult + card chip bonuses.
 - DISCARD: select cards you don't want, they are removed and you draw replacements from the deck.
 - Goal: maximize total score across all plays.
 
-Scoring — hand types (base_chips × base_mult):
-  High Card:        5 × 1 =     5   (any single card)
-  Pair:            10 × 2 =    20   (two cards of same rank)
-  Two Pair:        20 × 2 =    40   (two different pairs)
-  Three of a Kind: 30 × 3 =    90   (three cards of same rank)
-  Straight:        30 × 4 =   120   (5 cards with consecutive ranks, e.g. 5-6-7-8-9)
-  Flush:           35 × 4 =   140   (5 cards of the same suit)
-  Full House:      40 × 4 =   160   (three of a kind + a pair)
-  Four of a Kind:  60 × 7 =   420   (four cards of same rank)
-  Straight Flush: 100 × 8 =   800   (straight + flush combined)
+Scoring -- hand types (base_chips x base_mult):
+  High Card:        5 x 1 =     5   (any single card)
+  Pair:            10 x 2 =    20   (two cards of same rank)
+  Two Pair:        20 x 2 =    40   (two different pairs)
+  Three of a Kind: 30 x 3 =    90   (three cards of same rank)
+  Straight:        30 x 4 =   120   (5 cards with consecutive ranks, e.g. 5-6-7-8-9)
+  Flush:           35 x 4 =   140   (5 cards of the same suit)
+  Full House:      40 x 4 =   160   (three of a kind + a pair)
+  Four of a Kind:  60 x 7 =   420   (four cards of same rank)
+  Straight Flush: 100 x 8 =   800   (straight + flush combined)
 
 Card chip values (added to base chips for each scored card):
   A=11, K=10, Q=10, J=10, 10=10, 9=9, 8=8, 7=7, 6=6, 5=5, 4=4, 3=3, 2=2
@@ -150,22 +185,22 @@ Strategy tips:
 - Playing fewer but better cards is sometimes optimal (e.g. PLAY a Pair rather than a weak 5-card hand).
 
 Example 1:
-Hand: A♠, A♥, K♦, 10♣, 9♣, 7♦, 5♥, 3♣ | Plays: 4/5, Discards: 2/3
-PLAY A♠ A♥
+Hand: A\u2660, A\u2665, K\u2666, 10\u2663, 9\u2663, 7\u2666, 5\u2665, 3\u2663 | Plays: 4/5, Discards: 2/3
+PLAY A\u2660 A\u2665
 
 Example 2:
-Hand: Q♣, J♣, 8♣, 7♦, 6♠, 4♥, 3♣, 2♦ | Plays: 3/5, Discards: 3/3
-DISCARD 7♦ 6♠ 4♥ 2♦
+Hand: Q\u2663, J\u2663, 8\u2663, 7\u2666, 6\u2660, 4\u2665, 3\u2663, 2\u2666 | Plays: 3/5, Discards: 3/3
+DISCARD 7\u2666 6\u2660 4\u2665 2\u2666
 
 Example 3:
-Hand: K♥, K♦, K♣, 9♠, 8♥, 5♦, 4♣, 2♠ | Plays: 5/5, Discards: 0/3
-PLAY K♥ K♦ K♣
+Hand: K\u2665, K\u2666, K\u2663, 9\u2660, 8\u2665, 5\u2666, 4\u2663, 2\u2660 | Plays: 5/5, Discards: 0/3
+PLAY K\u2665 K\u2666 K\u2663
 
 IMPORTANT: Output ONLY the action line. No explanation, no analysis."""
 
 
 class CardLLMActionPrior:
-    """Queries LLM N times per state to form empirical card action prior."""
+    """Queries LLM N times per state to form empirical card action prior (436-dim)."""
 
     def __init__(self, model_name="Qwen/Qwen3-32B", num_votes=5,
                  temperature=0.7, cache_maxsize=2048,
@@ -183,8 +218,8 @@ class CardLLMActionPrior:
             model=model_name,
             trust_remote_code=True,
             gpu_memory_utilization=gpu_memory_utilization,
-            enforce_eager=True,       # 避免 Colab CUDA graph 冲突
-            max_model_len=4096,       # 我们的 prompt 很短，不需要 40K
+            enforce_eager=True,
+            max_model_len=4096,
         )
         if quantization:
             llm_kwargs["quantization"] = quantization
@@ -192,8 +227,8 @@ class CardLLMActionPrior:
         self.SamplingParams = SamplingParams
         self.sampling_params = SamplingParams(
             temperature=temperature,
-            max_tokens=300,         # Qwen3 needs room for <think>...</think> + answer
-            stop=["<|im_end|>"],    # proper Qwen3 stop token (不再用 \n 截断)
+            max_tokens=300,
+            stop=["<|im_end|>"],
         )
         print(f"[LLM] Model loaded successfully.")
 
@@ -202,17 +237,17 @@ class CardLLMActionPrior:
         self._cache_maxsize = cache_maxsize
         self._total_queries = 0
         self._cache_hits = 0
-        self._valid_votes_history = []  # valid votes per non-cached get_prior call (capped)
-        self._valid_votes_max = 500    # only keep last N for rolling average
+        self._valid_votes_history = []
+        self._valid_votes_max = 500
 
-        # JSONL logger for LLM responses
+        # JSONL logger
         self._llm_log_file = None
         self._llm_log_count = 0
-        self._llm_log_flush_interval = 50  # flush every N entries
+        self._llm_log_flush_interval = 50
         if llm_log_path:
             os.makedirs(os.path.dirname(llm_log_path), exist_ok=True)
             self._llm_log_file = open(llm_log_path, 'a')
-            print(f"[LLM] Response log → {llm_log_path}")
+            print(f"[LLM] Response log -> {llm_log_path}")
 
     # ── Prompt construction ───────────────────────────────────
     def _build_prompt(self, env):
@@ -229,7 +264,6 @@ class CardLLMActionPrior:
         lines.append(f"Plays remaining: {plays_left}/{env.max_play}, "
                      f"Discards remaining: {discards_left}/{env.max_discard}")
         lines.append(f"Score so far: {score:.0f}, Deck: {deck_remaining} cards left")
-
         lines.append("")
         lines.append("Choose your action:")
         return "\n".join(lines)
@@ -242,22 +276,17 @@ class CardLLMActionPrior:
     # ── Parse LLM response ───────────────────────────────────
     def _parse_response(self, text, hand):
         """
-        Parse "PLAY A♠ K♥ ..." or "DISCARD 3♣ 5♥ ..." → (type_int, card_indices)
-        Searches anywhere in text (Qwen3 often prepends analysis before the action line).
+        Parse "PLAY A\u2660 K\u2665 ..." or "DISCARD 3\u2663 5\u2665 ..." -> (type_int, card_indices)
         Returns (None, None) if parse fails.
         """
         text = text.strip()
-        # Strip Qwen3 thinking tags
         text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
-        # Search for PLAY or DISCARD anywhere in text (not just at start)
-        # Try each line, then try regex on full text
         action_type = None
         card_part = None
 
-        # Strategy 1: line-by-line search
         for line in text.split('\n'):
-            line = line.strip().strip('`').strip('*').strip()  # strip markdown
+            line = line.strip().strip('`').strip('*').strip()
             upper = line.upper()
             if upper.startswith("PLAY ") or upper == "PLAY":
                 action_type = 1
@@ -268,10 +297,9 @@ class CardLLMActionPrior:
                 card_part = line[7:].strip()
                 break
 
-        # Strategy 2: regex search for "PLAY card card..." or "DISCARD card card..."
         if action_type is None:
             m = re.search(
-                r'\b(PLAY|DISCARD)\s+((?:[AKQJ2-9]|10)[♥♦♣♠HDCS](?:\s+(?:[AKQJ2-9]|10)[♥♦♣♠HDCS])*)',
+                r'\b(PLAY|DISCARD)\s+((?:[AKQJ2-9]|10)[\u2665\u2666\u2663\u2660HDCS](?:\s+(?:[AKQJ2-9]|10)[\u2665\u2666\u2663\u2660HDCS])*)',
                 text, re.IGNORECASE
             )
             if m:
@@ -281,7 +309,6 @@ class CardLLMActionPrior:
         if action_type is None or card_part is None:
             return None, None
 
-        # Parse cards
         hand_set = set(hand)
         tokens = re.split(r'[,\s]+', card_part)
         card_indices = []
@@ -295,33 +322,13 @@ class CardLLMActionPrior:
 
         return action_type, card_indices
 
-    # ── Single query ──────────────────────────────────────────
-    def _query_single(self, prompt, hand):
-        try:
-            # ChatML format + /no_think 禁用 Qwen3 思考模式
-            full_prompt = (
-                f"<|im_start|>system\n{LLM_SYSTEM_PROMPT}<|im_end|>\n"
-                f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-            outputs = self.llm.generate([full_prompt], self.sampling_params)
-            text = outputs[0].outputs[0].text.strip()
-            result = self._parse_response(text, hand)
-            if result[0] is None:
-                print(f"[LLM WARNING] Unparseable response: {text!r}")
-            return result, text
-        except Exception as e:
-            print(f"[LLM WARNING] Query failed: {e}")
-            return (None, None), str(e)
-
     # ── N-vote prior ──────────────────────────────────────────
     def get_prior(self, env):
         """
-        Query LLM N times, return empirical action distributions.
+        Query LLM N times, return empirical action distribution over 436 combo actions.
 
         Returns:
-            p_type: np.ndarray (2,) — [P(discard), P(play)] with Laplace smoothing
-            p_card: np.ndarray (52,) — per-card selection frequency with smoothing
+            p_combo: np.ndarray (436,) -- probability per combo action with Laplace smoothing
         """
         key = self._state_key(env)
 
@@ -334,17 +341,14 @@ class CardLLMActionPrior:
         prompt = self._build_prompt(env)
         hand = env.hand
 
-        # Hand card indices for masking
-        hand_indices = set()
-        for r, s in hand:
-            hand_indices.add(_card_index(r, s))
+        # Hand card 52-dim indices (ordered by position)
+        hand_indices_52 = [_card_index(r, s) for r, s in hand]
 
-        type_counts = np.zeros(2, dtype=np.float32)  # [discard, play]
-        card_counts = np.zeros(52, dtype=np.float32)
+        combo_counts = np.zeros(NUM_ACTIONS, dtype=np.float32)
         valid_votes = 0
         raw_responses = []
 
-        # Batch all N votes into a single vLLM call
+        # Batch all N votes
         full_prompt = (
             f"<|im_start|>system\n{LLM_SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n"
@@ -360,56 +364,44 @@ class CardLLMActionPrior:
                 raw_responses.append(raw_text)
                 action_type, card_idx = self._parse_response(raw_text, hand)
                 if action_type is not None and card_idx:
-                    type_counts[action_type] += 1
-                    for ci in card_idx:
-                        card_counts[ci] += 1
-                    valid_votes += 1
+                    cidx = _card_selection_to_combo_idx(action_type, card_idx, hand_indices_52)
+                    if cidx is not None:
+                        combo_counts[cidx] += 1
+                        valid_votes += 1
+                    else:
+                        print(f"[LLM WARNING] Could not map to combo: type={action_type}, cards={card_idx}")
                 else:
                     print(f"[LLM WARNING] Unparseable response: {raw_text!r}")
         except Exception as e:
             print(f"[LLM WARNING] Batch query failed: {e}")
             self._total_queries += self.num_votes
 
-        # Laplace smoothing for type prior
-        eps_t = 0.01
+        # Laplace smoothing
+        eps = 0.001
         if valid_votes > 0:
-            p_type = (type_counts + eps_t) / (valid_votes + eps_t * 2)
+            p_combo = (combo_counts + eps) / (valid_votes + eps * NUM_ACTIONS)
         else:
-            p_type = np.array([0.5, 0.5], dtype=np.float32)
+            p_combo = np.ones(NUM_ACTIONS, dtype=np.float32) / NUM_ACTIONS
 
         # Normalize
-        p_type = p_type / p_type.sum()
-
-        # Per-card Bernoulli prior (only for hand cards)
-        eps_c = 0.01
-        if valid_votes > 0:
-            p_card = np.full(52, eps_c / (valid_votes + 1), dtype=np.float32)
-            for ci in hand_indices:
-                p_card[ci] = (card_counts[ci] + eps_c) / (valid_votes + eps_c * 2)
-        else:
-            p_card = np.full(52, 0.5, dtype=np.float32)
-
-        # Clamp to [eps, 1-eps] for Bernoulli KL stability
-        p_card = np.clip(p_card, 0.01, 0.99)
+        p_combo = p_combo / p_combo.sum()
 
         self._valid_votes_history.append(valid_votes)
         if len(self._valid_votes_history) > self._valid_votes_max:
             self._valid_votes_history = self._valid_votes_history[-self._valid_votes_max:]
 
         # Cache with LRU eviction
-        result = (p_type, p_card)
-        self._cache[key] = result
+        self._cache[key] = p_combo
         if len(self._cache) > self._cache_maxsize:
             self._cache.popitem(last=False)
 
-        # Log LLM responses to JSONL (batched flush to reduce Drive I/O)
+        # Log
         if self._llm_log_file is not None:
             hand_strs = [_card_to_str(r, s) for r, s in hand]
             log_entry = {
                 "query_id": self._total_queries,
                 "responses": raw_responses,
                 "valid_votes": valid_votes,
-                "p_type": p_type.tolist(),
                 "hand": hand_strs,
             }
             self._llm_log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
@@ -417,7 +409,7 @@ class CardLLMActionPrior:
             if self._llm_log_count % self._llm_log_flush_interval == 0:
                 self._llm_log_file.flush()
 
-        return result
+        return p_combo
 
     @property
     def total_queries(self):
@@ -429,63 +421,69 @@ class CardLLMActionPrior:
 
     @property
     def valid_vote_rate(self):
-        """Average fraction of valid votes per LLM query (0~1)."""
         if not self._valid_votes_history:
             return 0.0
         return float(np.mean(self._valid_votes_history)) / max(1, self.num_votes)
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. HesitationGate — 直接复用
+# 2. HesitationGate -- softmax variance over 436 actions
 # ════════════════════════════════════════════════════════════════
 
-# Card-specific HesitationGate (不复用 joker 版本，因为 card agent 的动作空间不同)
 class HesitationGate:
     """
-    Softmax variance gate on card selection logits.
+    Softmax variance gate for Categorical(436) action space.
 
-    h(s) = Var(softmax(logits_hand)) / σ²_max
-    h ≈ 0 → uniform over hand cards → uncertain → gate ON (query LLM)
-    h ≈ 1 → peaked on specific cards → confident → gate OFF
+    h(s) = 1 - Var(softmax(logits)) * num_valid_actions
+    h near 0 -> uniform (uncertain) -> gate ON
+    h near 1 -> peaked (decisive) -> gate OFF
 
-    num_actions is dynamically set to hand size per call (typically 8).
+    Actually we use normalized entropy:
+    h(s) = 1 - H(pi) / log(num_valid)
+    h=0 -> max entropy (uniform) -> uncertain -> gate ON
+    h=1 -> zero entropy (deterministic) -> certain -> gate OFF
     """
-    def __init__(self, num_actions=8, tau=0.3):
+    def __init__(self, tau=0.3):
         self.tau = tau
 
-    def compute_h(self, card_logits, hand_mask):
+    def compute_h(self, action_logits, valid_mask):
         """
-        card_logits: (B, 52) raw logits
-        hand_mask:   (B, 52) float — 1 for cards in hand
+        action_logits: (B, 436)
+        valid_mask:    (B, 436) bool
+
         Returns h: (B,) in [0, 1]
         """
-        # Mask out non-hand cards
-        masked_logits = card_logits + (1.0 - hand_mask) * (-1e8)
-        probs = F.softmax(masked_logits, dim=-1)          # (B, 52)
-        # Variance over all 52 dims (non-hand probs ≈ 0, contributes ~0)
-        n_hand = hand_mask.sum(dim=-1).clamp(min=1.0)     # (B,)
-        mean_p = (probs * hand_mask).sum(dim=-1, keepdim=True) / n_hand.unsqueeze(-1)
-        var_p = ((probs - mean_p) ** 2 * hand_mask).sum(dim=-1) / n_hand
-        # σ²_max = (n-1)/n² for n hand cards
-        sigma2_max = (n_hand - 1) / (n_hand ** 2)
-        h = var_p / sigma2_max.clamp(min=1e-12)
+        # Mask invalid to -inf
+        masked_logits = action_logits.clone()
+        masked_logits[~valid_mask] = -1e8
+
+        # Compute entropy of the categorical distribution
+        log_probs = F.log_softmax(masked_logits, dim=-1)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1)  # (B,)
+
+        # Normalize by log(num_valid)
+        num_valid = valid_mask.float().sum(dim=-1).clamp(min=2.0)  # (B,)
+        max_entropy = torch.log(num_valid)
+        h = 1.0 - entropy / max_entropy.clamp(min=1e-8)
         return h.clamp(0.0, 1.0)
 
-    def __call__(self, card_logits, hand_mask):
-        h = self.compute_h(card_logits, hand_mask)
+    def __call__(self, action_logits, valid_mask):
+        h = self.compute_h(action_logits, valid_mask)
         gate = (h < self.tau).float()
         return gate, h
 
 
 # ════════════════════════════════════════════════════════════════
-# 3. HesitationCardPPOAgent — PPO + hesitation gate + KL
+# 3. HesitationCardPPOAgent -- PPO + hesitation gate + KL
 # ════════════════════════════════════════════════════════════════
 
 class HesitationCardPPOAgent:
     """
-    PPO agent for card play/discard with hesitation-gated LLM prior.
+    PPO agent for card play/discard with Categorical(436) action space
+    and hesitation-gated LLM prior.
 
-    Loss = standard_ppo_loss + α * E[g(s) * (KL_type + KL_card)]
+    Loss = standard_ppo_loss + alpha * E[g(s) * KL(pi||p_LLM)]
     """
 
     def __init__(self, obs_dim, max_hand_size, device,
@@ -503,7 +501,7 @@ class HesitationCardPPOAgent:
         self.max_hand_size = max_hand_size
         self.alpha = alpha
 
-        # Adaptive α
+        # Adaptive alpha
         self.kl_target = kl_target
         self.alpha_min = alpha_min
         self.alpha_max = alpha_max
@@ -523,25 +521,16 @@ class HesitationCardPPOAgent:
             self.opt, [warmup_sched, cosine_sched], milestones=[warmup_steps]
         )
 
-        # H3: discard mask loss coef
-        self.coef_sel_dis = 0.3
-        self.coef_sel_dis_target = 0.80
-
-        # H5: mask entropy coef
-        self.mask_ent_coef = 0.1
-        self.mask_ent_coef_start = 0.1
-        self.mask_ent_coef_end = 0.02
-
         # Hesitation gate + LLM prior
-        self.gate = HesitationGate(num_actions=max_hand_size, tau=tau)
+        self.gate = HesitationGate(tau=tau)
         self.llm_prior = llm_prior
 
         # Statistics
         self.gate_stats = {
             "total": 0, "active": 0,
-            "h_sum": 0.0, "h_count": 0,  # running average instead of list
-            "agreements": 0,       # LLM type == agent type count
-            "llm_samples": 0,      # total gated steps with LLM response
+            "h_sum": 0.0, "h_count": 0,
+            "agreements": 0,
+            "llm_samples": 0,
         }
 
     # ── Act (single step) ────────────────────────────────────
@@ -551,155 +540,114 @@ class HesitationCardPPOAgent:
         Sample action; query LLM if hesitation gate fires.
 
         Returns:
-            a_type, a_mask, logp_type, logp_mask, value, entropy,
-            p_llm_type (np.array(2,) or None),
-            p_llm_card (np.array(52,) or None),
-            gate_active (bool)
+            a_type, card_mask_52, combo_idx, logprob, value, entropy,
+            p_llm_combo (np.array(436,) or None),
+            gate_active (bool), h_value (float)
         """
         self.net.eval()
         x = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits_type, logits_sel_play, logits_sel_dis, value = self.net(x)
+        action_logits, value = self.net(x)
 
-        # H7: mask discard when discard_count=0
-        if obs_np[209] < 0.01:
-            logits_type[0, 0] = -1e8
+        # Build valid action mask
+        hand_indices = _get_hand_indices(obs_np)
+        hand_size = len(hand_indices)
+        can_discard = obs_np[209] >= 0.01
+        valid_mask = get_valid_action_mask(hand_size, can_discard, device=self.device).unsqueeze(0)  # (1, 436)
 
-        # Sample type first (needed to pick play/discard subnet for gate)
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        a_type_t = dist_type.sample()
-        a_type = int(a_type_t.item())
+        # Mask invalid actions
+        action_logits[~valid_mask] = -1e8
 
-        # Card mask
-        hand_mask = torch.as_tensor(obs_np[:52], dtype=torch.float32, device=self.device).unsqueeze(0)
-        hand_indices = torch.where(hand_mask[0] > 0.5)[0]
+        # Hesitation gate
+        gate_val, h_val = self.gate(action_logits, valid_mask)
+        gate_active = bool(gate_val.item() > 0.5)
+        h_value = float(h_val.item())
 
-        if len(hand_indices) == 0:
-            a_mask = np.zeros(52, dtype=np.int64)
-            logprob_mask = torch.zeros((1,), device=self.device)
-            entropy_mask = torch.zeros((1,), device=self.device)
-            h_value = 1.0  # no cards → fully certain (no gate)
-            gate_active = False
-        else:
-            logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
+        # Sample from Categorical
+        dist = torch.distributions.Categorical(logits=action_logits[0])
+        combo_idx_t = dist.sample()
+        combo_idx = int(combo_idx_t.item())
 
-            # Hesitation gate on card selection logits
-            gate_val, h_val = self.gate(logits_active, hand_mask)
-            gate_active = bool(gate_val.item() > 0.5)
-            h_value = float(h_val.item())
-
-            logits_valid = logits_active[:, hand_indices]
-            dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
-            sampled = dist_bern.sample()
-
-            if a_type == 1 and sampled.sum() < 1:
-                idx = torch.argmax(logits_valid, dim=1)
-                sampled[0, idx] = 1.0
-
-            a_mask_52 = torch.zeros((1, 52), dtype=torch.float32, device=self.device)
-            a_mask_52[0, hand_indices] = sampled[0]
-
-            a_mask = a_mask_52.squeeze(0).to(torch.int64).detach().cpu().numpy()
-            logprob_mask = dist_bern.log_prob(sampled).sum(dim=1)
-            entropy_mask = dist_bern.entropy().sum(dim=1)
+        logprob = dist.log_prob(combo_idx_t)
+        entropy = dist.entropy()
 
         self.gate_stats["total"] += 1
         self.gate_stats["h_sum"] += h_value
         self.gate_stats["h_count"] += 1
 
         # Query LLM if gate active
-        p_llm_type, p_llm_card = None, None
+        p_llm_combo = None
         if gate_active and self.llm_prior is not None and env is not None:
             self.gate_stats["active"] += 1
-            p_llm_type, p_llm_card = self.llm_prior.get_prior(env)
+            p_llm_combo = self.llm_prior.get_prior(env)
 
-            # ── LLM action override: directly use LLM's action ──
-            if p_llm_type is not None:
-                llm_type = int(np.argmax(p_llm_type))
-                # Respect H7: can't discard if discard_count=0
-                if llm_type == 0 and obs_np[209] < 0.01:
-                    llm_type = 1
-                a_type = llm_type
-                a_type_t = torch.tensor([a_type], device=self.device)
+            # LLM action override: use LLM's most-voted combo
+            if p_llm_combo is not None:
+                # Find best valid combo from LLM prior
+                llm_probs_t = torch.as_tensor(p_llm_combo, dtype=torch.float32, device=self.device)
+                llm_probs_t[~valid_mask[0]] = 0.0
+                if llm_probs_t.sum() > 0:
+                    llm_combo_idx = int(llm_probs_t.argmax().item())
+                    combo_idx = llm_combo_idx
+                    combo_idx_t = torch.tensor(combo_idx, device=self.device)
 
-                # Use LLM's card prior: pick cards with p > 0.5
-                if len(hand_indices) > 0:
-                    llm_card_mask = (p_llm_card > 0.5).astype(np.float32)
-                    # Fallback: if LLM selected nothing, pick top card
-                    if llm_card_mask.sum() < 1 and a_type == 1:
-                        llm_card_mask[np.argmax(p_llm_card)] = 1.0
-                    a_mask = llm_card_mask.astype(np.int64)
-
-                    # Recompute logprob under PPO policy for the LLM-chosen action
-                    logits_active = logits_sel_play if a_type == 1 else logits_sel_dis
-                    logits_valid = logits_active[:, hand_indices]
-                    dist_bern = torch.distributions.Bernoulli(logits=logits_valid)
-                    hand_idx_cpu = hand_indices.cpu().numpy()
-                    chosen = torch.as_tensor(
-                        a_mask[hand_idx_cpu],
-                        dtype=torch.float32, device=self.device
-                    ).unsqueeze(0)
-                    logprob_mask = dist_bern.log_prob(chosen).sum(dim=1)
-                    entropy_mask = dist_bern.entropy().sum(dim=1)
-
-                # Recompute type logprob
-                dist_type = torch.distributions.Categorical(logits=logits_type)
-                logprob_type_override = dist_type.log_prob(a_type_t)
+                    # Recompute logprob under policy for LLM-chosen action
+                    logprob = dist.log_prob(combo_idx_t)
 
         # Track LLM-agent agreement
-        if p_llm_type is not None:
-            llm_preferred_type = int(np.argmax(p_llm_type))
-            if llm_preferred_type == a_type:
+        if p_llm_combo is not None:
+            llm_best = int(np.argmax(p_llm_combo))
+            # Check if same type (play vs discard)
+            agent_type = 1 if combo_idx < NUM_COMBOS else 0
+            llm_type = 1 if llm_best < NUM_COMBOS else 0
+            if agent_type == llm_type:
                 self.gate_stats["agreements"] += 1
             self.gate_stats["llm_samples"] += 1
 
-        logprob_type = dist_type.log_prob(a_type_t)
-        entropy_type = dist_type.entropy()
-        total_entropy = entropy_type + entropy_mask
+        # Convert to env action
+        a_type, card_mask_52 = combo_idx_to_card_mask(combo_idx, hand_indices)
+
         value = value.squeeze(0)
 
         return (
-            a_type, a_mask,
-            float(logprob_type.item()), float(logprob_mask.item()),
-            float(value.item()), float(total_entropy.item()),
-            p_llm_type, p_llm_card, gate_active, h_value,
+            a_type, card_mask_52, combo_idx,
+            float(logprob.item()),
+            float(value.item()), float(entropy.item()),
+            p_llm_combo, gate_active, h_value,
         )
 
     # ── Evaluate actions (batch) ──────────────────────────────
-    def evaluate_actions(self, obs_b, a_type_b, a_mask_b):
-        """Returns: logp_type, logp_mask, values, ent_type, ent_mask, logits_type, logits_card"""
-        logits_type, logits_sel_play, logits_sel_dis, values = self.net(obs_b)
+    def evaluate_actions(self, obs_b, combo_idx_b):
+        """
+        Returns: logprob, values, entropy, action_logits
+        """
+        action_logits, values = self.net(obs_b)
 
-        # H7
-        no_discard = obs_b[:, 209] < 0.01
-        logits_type[no_discard, 0] = -1e8
+        # Build valid masks for entire batch
+        hand_sizes = obs_b[:, :52].sum(dim=1).long()  # (N,)
+        can_discard = obs_b[:, 209] >= 0.01  # (N,)
 
-        dist_type = torch.distributions.Categorical(logits=logits_type)
-        logprob_type = dist_type.log_prob(a_type_b)
-        entropy_type = dist_type.entropy()
+        cmp = COMBO_MAX_POS.to(self.device)  # (218,) — precomputed
+        play_valid = cmp.unsqueeze(0) < hand_sizes.unsqueeze(1)  # (N, 218)
+        discard_valid = play_valid & can_discard.unsqueeze(1)  # (N, 218)
+        valid_mask = torch.cat([play_valid, discard_valid], dim=1)  # (N, 436)
 
-        hand_mask = obs_b[:, :52]
-        is_play = (a_type_b == 1).unsqueeze(1)
-        logits_active = torch.where(is_play, logits_sel_play, logits_sel_dis)
+        # Clone to avoid in-place mutation of forward output (breaks autograd)
+        masked_logits = action_logits.clone()
+        masked_logits[~valid_mask] = -1e8
 
-        logits_masked = logits_active.clone()
-        logits_masked[hand_mask < 0.5] = -1e8
+        dist = torch.distributions.Categorical(logits=masked_logits)
+        logprob = dist.log_prob(combo_idx_b)
+        entropy = dist.entropy()
 
-        dist_bern = torch.distributions.Bernoulli(logits=logits_masked)
-        logprob_mask = (dist_bern.log_prob(a_mask_b.float()) * hand_mask).sum(dim=1)
-        entropy_mask = (dist_bern.entropy() * hand_mask).sum(dim=1)
-
-        return (logprob_type, logprob_mask, values, entropy_type, entropy_mask,
-                logits_type, logits_masked)
+        return logprob, values, entropy, masked_logits, valid_mask
 
     # ── PPO Update with hesitation-gated KL ──────────────────
     def update(self, traj):
         obs = torch.as_tensor(np.array(traj["obs"]), dtype=torch.float32, device=self.device)
-        a_type = torch.as_tensor(np.array(traj["a_type"]), dtype=torch.long, device=self.device)
-        a_mask = torch.as_tensor(np.array(traj["a_mask"]), dtype=torch.long, device=self.device)
+        combo_idx = torch.as_tensor(np.array(traj["combo_idx"]), dtype=torch.long, device=self.device)
 
         with torch.no_grad():
-            old_logp_type = torch.as_tensor(np.array(traj["logp_type"]), dtype=torch.float32, device=self.device)
-            old_logp_mask = torch.as_tensor(np.array(traj["logp_mask"]), dtype=torch.float32, device=self.device)
+            old_logp = torch.as_tensor(np.array(traj["logp"]), dtype=torch.float32, device=self.device)
             values = torch.as_tensor(np.array(traj["val"]), dtype=torch.float32, device=self.device)
             rewards = np.array(traj["rew"], dtype=np.float32)
             dones = np.array(traj["done"], dtype=np.float32)
@@ -717,91 +665,61 @@ class HesitationCardPPOAgent:
         gate_flags = np.array(traj["gate"], dtype=np.float32)
         gate_t = torch.as_tensor(gate_flags, dtype=torch.float32, device=self.device)
 
-        # LLM priors — fill None with uniform (masked out by gate=0)
-        uniform_type = np.array([0.5, 0.5], dtype=np.float32)
-        uniform_card = np.full(52, 0.5, dtype=np.float32)
-        p_llm_type_list = [p if p is not None else uniform_type for p in traj["p_llm_type"]]
-        p_llm_card_list = [p if p is not None else uniform_card for p in traj["p_llm_card"]]
-        p_llm_type_t = torch.as_tensor(np.array(p_llm_type_list), dtype=torch.float32, device=self.device)
-        p_llm_card_t = torch.as_tensor(np.array(p_llm_card_list), dtype=torch.float32, device=self.device)
+        # LLM priors -- fill None with uniform (masked out by gate=0)
+        uniform_combo = np.ones(NUM_ACTIONS, dtype=np.float32) / NUM_ACTIONS
+        p_llm_list = [p if p is not None else uniform_combo for p in traj["p_llm_combo"]]
+        p_llm_t = torch.as_tensor(np.array(p_llm_list), dtype=torch.float32, device=self.device)
 
         N = obs.size(0)
         idx = np.arange(N)
 
         log_info = {"pol_loss": 0.0, "v_loss": 0.0, "ent": 0.0,
-                     "kl_loss": 0.0, "kl_type_loss": 0.0, "kl_card_loss": 0.0,
-                     "n_batches": 0}
+                     "kl_loss": 0.0, "n_batches": 0}
 
         for _ in range(self.epochs):
             np.random.shuffle(idx)
             for s in range(0, N, self.mb_size):
                 mb = idx[s:s + self.mb_size]
-                mb_obs, mb_type, mb_mask = obs[mb], a_type[mb], a_mask[mb]
-                mb_old_logp_type = old_logp_type[mb]
-                mb_old_logp_mask = old_logp_mask[mb]
+                mb_obs = obs[mb]
+                mb_combo = combo_idx[mb]
+                mb_old_logp = old_logp[mb]
                 mb_ret, mb_adv = returns[mb], advantages[mb]
                 mb_old_v = values[mb].detach()
 
-                (new_logp_type, new_logp_mask, new_v, ent_type, ent_mask,
-                 cur_logits_type, cur_logits_card) = self.evaluate_actions(
-                    mb_obs, mb_type, mb_mask
+                new_logp, new_v, ent, cur_logits, valid_mask = self.evaluate_actions(
+                    mb_obs, mb_combo
                 )
 
-                # ── Type head PPO loss ────────────────────────
-                ratio_type = torch.exp(new_logp_type - mb_old_logp_type)
-                unclipped_t = -ratio_type * mb_adv
-                clipped_t = -torch.clamp(ratio_type, 1 - self.clip, 1 + self.clip) * mb_adv
-                pol_loss_type = torch.max(unclipped_t, clipped_t).mean()
+                # PPO clipped policy loss
+                ratio = torch.exp(new_logp - mb_old_logp)
+                unclipped = -ratio * mb_adv
+                clipped = -torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * mb_adv
+                pol_loss = torch.max(unclipped, clipped).mean()
 
-                # ── Card mask PPO loss (play/discard separate) ─
-                ratio_mask = torch.exp(new_logp_mask - mb_old_logp_mask)
-                unclipped_m = -ratio_mask * mb_adv
-                clipped_m = -torch.clamp(ratio_mask, 1 - self.clip, 1 + self.clip) * mb_adv
-                per_sample_m = torch.max(unclipped_m, clipped_m)
-
-                m_play = (mb_type == 1)
-                m_dis = (mb_type == 0)
-                pol_loss_mask_play = per_sample_m[m_play].mean() if m_play.any() else torch.tensor(0.0, device=self.device)
-                pol_loss_mask_dis = per_sample_m[m_dis].mean() if m_dis.any() else torch.tensor(0.0, device=self.device)
-
-                pol_loss = pol_loss_type + pol_loss_mask_play + self.coef_sel_dis * pol_loss_mask_dis
-
-                # ── Value loss with clipping ──────────────────
+                # Value loss with clipping
                 vclip = 0.2
                 v_clipped = mb_old_v + torch.clamp(new_v - mb_old_v, -vclip, vclip)
                 v_loss = torch.max((new_v - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
 
-                # ── Entropy ───────────────────────────────────
-                ent = ent_type.mean() + self.mask_ent_coef * ent_mask.mean()
+                # Entropy
+                ent_mean = ent.mean()
 
-                # ── Gated KL (type + card) ────────────────────
-                # Type KL: KL(Categorical(π_type) || Categorical(p_llm_type))
-                pi_type = F.softmax(cur_logits_type, dim=-1)
-                mb_p_llm_type = p_llm_type_t[mb].clamp(min=1e-8)
-                kl_type = (pi_type * (pi_type.clamp(min=1e-8).log() - mb_p_llm_type.log())).sum(dim=-1)
-                kl_type = kl_type.clamp(0.0, 10.0)
+                # Gated Categorical KL: KL(pi || p_LLM)
+                pi = F.softmax(cur_logits, dim=-1)  # (mb, 436)
+                mb_p_llm = p_llm_t[mb].clamp(min=1e-8)
+                # Only compute KL over valid actions
+                kl_per = pi * (pi.clamp(min=1e-8).log() - mb_p_llm.log())
+                kl_per[~valid_mask] = 0.0
+                kl = kl_per.sum(dim=-1)  # (mb,)
+                kl = kl.clamp(0.0, 50.0)
 
-                # Card KL: Σ_i∈hand KL(Bernoulli(σ(logit_i)) || Bernoulli(p_llm_card_i))
-                hand_mask_mb = mb_obs[:, :52]
-                pi_card = torch.sigmoid(cur_logits_card)  # (mb, 52)
-                mb_p_llm_card = p_llm_card_t[mb].clamp(min=1e-8, max=1.0 - 1e-8)
-                pi_card_safe = pi_card.clamp(min=1e-8, max=1.0 - 1e-8)
-
-                kl_card_per = (
-                    pi_card_safe * (pi_card_safe.log() - mb_p_llm_card.log())
-                    + (1 - pi_card_safe) * ((1 - pi_card_safe).log() - (1 - mb_p_llm_card).log())
-                )
-                kl_card = (kl_card_per * hand_mask_mb).sum(dim=-1)  # (mb,)
-                kl_card = kl_card.clamp(0.0, 50.0)
-
-                # Gate
                 mb_gate = gate_t[mb]
-                gated_kl = (mb_gate * (kl_type + kl_card)).mean()
+                gated_kl = (mb_gate * kl).mean()
 
-                # ── Total loss ────────────────────────────────
+                # Total loss
                 loss = (pol_loss
                         + self.vcoef * v_loss
-                        - self.ecoef * ent
+                        - self.ecoef * ent_mean
                         + self.alpha * gated_kl)
 
                 if not torch.isfinite(loss):
@@ -815,13 +733,11 @@ class HesitationCardPPOAgent:
 
                 log_info["pol_loss"] += pol_loss.item()
                 log_info["v_loss"] += v_loss.item()
-                log_info["ent"] += ent.mean().item()
+                log_info["ent"] += ent_mean.item()
                 log_info["kl_loss"] += gated_kl.item()
-                log_info["kl_type_loss"] += (mb_gate * kl_type).mean().item()
-                log_info["kl_card_loss"] += (mb_gate * kl_card).mean().item()
                 log_info["n_batches"] += 1
 
-        # ── Adaptive α ─────────────────────────────────────
+        # Adaptive alpha
         nb = max(1, log_info["n_batches"])
         avg_kl = log_info["kl_loss"] / nb
         old_alpha = self.alpha
@@ -890,11 +806,11 @@ def train_card_hesitation(
     quantization="",
     # Resume from checkpoint
     resume_checkpoint="",
-    # Output directory (可指向 Drive 路径以持久化)
+    # Output directory
     output_dir="outputs/card_hesitation",
 ):
     """
-    Train card agent with hesitation-gated LLM prior.
+    Train card agent with hesitation-gated LLM prior (Categorical 436-dim action space).
 
     If llm_model is empty, falls back to pure PPO (no LLM).
     If resume_checkpoint is given, loads weights + optimizer and continues from saved step.
@@ -924,9 +840,9 @@ def train_card_hesitation(
             llm_log_path=llm_log_path,
             quantization=quantization if quantization else None,
         )
-        print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, τ={tau}, α={alpha}")
+        print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, tau={tau}, alpha={alpha}")
     else:
-        print(f"[Init] No LLM — pure PPO mode (τ={tau}, α={alpha} ignored)")
+        print(f"[Init] No LLM -- pure PPO mode (tau={tau}, alpha={alpha} ignored)")
 
     # ── Environment ───────────────────────────────────────────
     env = BalatroEnv(max_hand_size=max_hand_size, max_play=max_play,
@@ -935,6 +851,8 @@ def train_card_hesitation(
     obs_dim = env.observation_space.shape[0]
 
     total_updates = int(math.ceil(total_steps / float(update_steps)))
+
+    print(f"[Init] Action space: Categorical({NUM_ACTIONS}) (play={NUM_COMBOS} + discard={NUM_COMBOS})")
 
     # ── Agent ─────────────────────────────────────────────────
     agent = HesitationCardPPOAgent(
@@ -960,7 +878,7 @@ def train_card_hesitation(
         if "config" in ckpt and "alpha" in ckpt["config"]:
             agent.alpha = ckpt["config"]["alpha"]
         print(f"[Resume] Loaded {resume_checkpoint}")
-        print(f"[Resume] Continuing from step={resume_step}, episode={resume_episode}, α={agent.alpha:.4f}")
+        print(f"[Resume] Continuing from step={resume_step}, episode={resume_episode}, alpha={agent.alpha:.4f}")
 
     print(f"[Init] device={device}, seed={seed}, total_steps={total_steps}")
     print(f"[Init] Run name: {run_name}")
@@ -971,15 +889,6 @@ def train_card_hesitation(
         frac = min(1.0, updates_done / max(1, total_updates))
         return float(ecoef_start + (ecoef_end - ecoef_start) * frac)
 
-    def anneal_coef_dis():
-        warmup_frac = 0.1
-        frac = min(1.0, updates_done / max(1, int(total_updates * warmup_frac)))
-        return float(0.3 + (agent.coef_sel_dis_target - 0.3) * frac)
-
-    def anneal_mask_ent_coef():
-        frac = min(1.0, updates_done / max(1, total_updates))
-        return float(agent.mask_ent_coef_start + (agent.mask_ent_coef_end - agent.mask_ent_coef_start) * frac)
-
     # ── Statistics ────────────────────────────────────────────
     ep_returns_train, ep_ret_train = [], 0.0
     ep_returns_plot, ep_ret_plot = [], 0.0
@@ -987,22 +896,25 @@ def train_card_hesitation(
     ep_play_ratios = []
     ep_play_count, ep_discard_count = 0, 0
     gate_rates = []
-    h_value_history = []      # avg h(s) per update cycle
+    h_value_history = []
     kl_values = []
-    kl_type_values = []
-    kl_card_values = []
     alpha_history = []
     agreement_rates = []
     valid_vote_rates = []
 
-    csv_file = open(log_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
+    # Resume: append to existing CSV; fresh: write header
+    csv_header = [
         'episode', 'steps', 'return_train', 'return_plot', 'actual_score',
         'avg_score_100', 'play_ratio', 'gate_rate', 'avg_h', 'avg_kl',
-        'kl_type', 'kl_card', 'alpha', 'llm_agree_rate', 'valid_vote_rate',
-        'ecoef', 'coef_dis', 'llm_queries', 'cache_hits',
-    ])
+        'alpha', 'llm_agree_rate', 'valid_vote_rate',
+        'ecoef', 'llm_queries', 'cache_hits',
+    ]
+    if resume_checkpoint and os.path.isfile(log_path):
+        csv_file = open(log_path, 'a', newline='')
+    else:
+        csv_file = open(log_path, 'w', newline='')
+        csv.writer(csv_file).writerow(csv_header)
+    csv_writer = csv.writer(csv_file)
     csv_file.flush()
 
     total_collected = resume_step
@@ -1012,33 +924,30 @@ def train_card_hesitation(
     try:
         while total_collected < total_steps:
             traj = {
-                "obs": [], "a_type": [], "a_mask": [],
-                "logp_type": [], "logp_mask": [],
+                "obs": [], "combo_idx": [],
+                "logp": [],
                 "val": [], "rew": [], "done": [],
-                "p_llm_type": [], "p_llm_card": [], "gate": [],
+                "p_llm_combo": [], "gate": [],
             }
             steps = 0
 
             while steps < update_steps and total_collected < total_steps:
                 result = agent.act(obs, env=env)
-                a_type_val, a_mask_val = result[0], result[1]
-                logp_type, logp_mask = result[2], result[3]
+                a_type_val, card_mask_52, combo_idx = result[0], result[1], result[2]
+                logp = result[3]
                 val = result[4]
-                p_llm_type, p_llm_card, gate_active = result[6], result[7], result[8]
-                h_val = result[9]
+                p_llm_combo, gate_active = result[6], result[7]
+                h_val = result[8]
 
-                next_obs, reward, done, _ = env.step((a_type_val, a_mask_val))
+                next_obs, reward, done, _ = env.step((a_type_val, card_mask_52))
 
                 traj["obs"].append(obs)
-                traj["a_type"].append(a_type_val)
-                traj["a_mask"].append(a_mask_val)
-                traj["logp_type"].append(logp_type)
-                traj["logp_mask"].append(logp_mask)
+                traj["combo_idx"].append(combo_idx)
+                traj["logp"].append(logp)
                 traj["val"].append(val)
                 traj["rew"].append(reward)
                 traj["done"].append(done)
-                traj["p_llm_type"].append(p_llm_type)
-                traj["p_llm_card"].append(p_llm_card)
+                traj["p_llm_combo"].append(p_llm_combo)
                 traj["gate"].append(gate_active)
 
                 ep_ret_train += reward
@@ -1062,7 +971,7 @@ def train_card_hesitation(
                         "score5": f"{recent5_plot:.0f}",
                         "pr": f"{recent_pr:.2f}",
                         "gate": f"{gate_rate:.1%}",
-                        "α": f"{agent.alpha:.3f}",
+                        "alpha": f"{agent.alpha:.3f}",
                         "llm": llm_prior.total_queries if llm_prior else 0,
                     })
 
@@ -1078,16 +987,14 @@ def train_card_hesitation(
                     if len(ep_returns_train) % log_interval == 0:
                         avg_score_100 = float(np.mean(ep_actual_scores[-100:])) if len(ep_actual_scores) >= 100 else float(np.mean(ep_actual_scores))
                         avg_kl = kl_values[-1] if kl_values else 0.0
-                        avg_kl_t = kl_type_values[-1] if kl_type_values else 0.0
-                        avg_kl_c = kl_card_values[-1] if kl_card_values else 0.0
                         csv_writer.writerow([
                             len(ep_returns_train), total_collected,
                             ep_ret_train, ep_ret_plot, env.cumulative_score,
                             avg_score_100, play_ratio, gate_rate, agent.avg_h_value,
-                            avg_kl, avg_kl_t, avg_kl_c, agent.alpha,
+                            avg_kl, agent.alpha,
                             agent.llm_agreement_rate,
                             llm_prior.valid_vote_rate if llm_prior else 0.0,
-                            agent.ecoef, agent.coef_sel_dis,
+                            agent.ecoef,
                             llm_prior.total_queries if llm_prior else 0,
                             llm_prior.cache_hits if llm_prior else 0,
                         ])
@@ -1110,8 +1017,10 @@ def train_card_hesitation(
                             "obs_dim": obs_dim, "max_hand_size": max_hand_size,
                             "max_play": max_play, "tau": tau, "alpha": agent.alpha,
                             "shaping_beta": shaping_beta, "discard_cost": discard_cost,
+                            "action_space": "categorical_436",
                         },
                     }, ckpt_path)
+                    csv_file.flush()  # 保证 Colab 崩溃时 log 不丢
                     print(f"\n[Checkpoint] Saved to {ckpt_path}")
                     last_checkpoint_step = total_collected
 
@@ -1120,16 +1029,12 @@ def train_card_hesitation(
 
             updates_done += 1
             agent.ecoef = anneal_ecoef()
-            agent.coef_sel_dis = anneal_coef_dis()
-            agent.mask_ent_coef = anneal_mask_ent_coef()
             agent.scheduler.step()
 
-            # Track KL + alpha + new metrics
+            # Track KL + alpha
             nb = max(1, log_info["n_batches"])
             avg_kl_val = log_info["kl_loss"] / nb
             kl_values.append(avg_kl_val)
-            kl_type_values.append(log_info["kl_type_loss"] / nb)
-            kl_card_values.append(log_info["kl_card_loss"] / nb)
             alpha_history.append(agent.alpha)
             h_value_history.append(agent.avg_h_value)
             agreement_rates.append(agent.llm_agreement_rate)
@@ -1145,7 +1050,7 @@ def train_card_hesitation(
 
     except KeyboardInterrupt:
         pbar.close()
-        print("\n[Info] Interrupted — saving...")
+        print("\n[Info] Interrupted -- saving...")
 
     finally:
         csv_file.close()
@@ -1161,14 +1066,15 @@ def train_card_hesitation(
             "obs_dim": obs_dim, "max_hand_size": max_hand_size,
             "max_play": max_play, "tau": tau, "alpha": agent.alpha,
             "shaping_beta": shaping_beta, "discard_cost": discard_cost,
+            "action_space": "categorical_436",
         },
     }, final_path)
-    print(f"[Save] Final model → {final_path}")
+    print(f"[Save] Final model -> {final_path}")
 
-    # ── Plot training curves (4×2) ───────────────────────────
+    # ── Plot training curves (4x2) ───────────────────────────
     if len(ep_returns_train) > 0:
         fig, axes = plt.subplots(5, 2, figsize=(14, 25))
-        fig.suptitle(f'Card Hesitation-Gated LLM Prior — {run_name}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'Card Hesitation-Gated LLM Prior -- {run_name}', fontsize=14, fontweight='bold')
 
         window = min(100, max(5, len(ep_actual_scores) // 5))
 
@@ -1238,32 +1144,23 @@ def train_card_hesitation(
             ax.legend(loc='upper left')
         if alpha_history:
             ax2 = ax.twinx()
-            ax2.plot(np.arange(len(alpha_history)), alpha_history, lw=1.5, color='steelblue', label='α')
-            ax2.set_ylabel('α (adaptive)', color='steelblue')
+            ax2.plot(np.arange(len(alpha_history)), alpha_history, lw=1.5, color='steelblue', label='alpha')
+            ax2.set_ylabel('alpha (adaptive)', color='steelblue')
             ax2.legend(loc='upper right')
         ax.set_xlabel('Update')
-        ax.set_title('KL Divergence + Adaptive α'); ax.grid(True, ls='--', alpha=0.4)
+        ax.set_title('KL Divergence + Adaptive alpha'); ax.grid(True, ls='--', alpha=0.4)
 
-        # (3,0) h(s) distribution + avg h over updates
+        # (3,0) h(s) over updates
         ax = axes[3, 0]
         if h_value_history:
             ax.plot(np.arange(len(h_value_history)), h_value_history, lw=1.5, color='teal', label='Avg h(s)')
-            ax.axhline(y=agent.gate.tau, ls='--', color='red', lw=1, label=f'τ={agent.gate.tau}')
+            ax.axhline(y=agent.gate.tau, ls='--', color='red', lw=1, label=f'tau={agent.gate.tau}')
             ax.set_xlabel('Update'); ax.set_ylabel('Avg h(s)')
             ax.set_title('Hesitation h(s) Over Updates'); ax.grid(True, ls='--', alpha=0.4)
             ax.set_ylim(-0.05, 1.05); ax.legend()
 
-        # (3,1) KL_type vs KL_card over updates
+        # (3,1) LLM agreement rate + valid vote rate
         ax = axes[3, 1]
-        if kl_type_values:
-            ax.plot(np.arange(len(kl_type_values)), kl_type_values, lw=1.5, color='coral', label='KL_type')
-        if kl_card_values:
-            ax.plot(np.arange(len(kl_card_values)), kl_card_values, lw=1.5, color='steelblue', label='KL_card')
-        ax.set_xlabel('Update'); ax.set_ylabel('Avg Gated KL')
-        ax.set_title('KL_type vs KL_card'); ax.grid(True, ls='--', alpha=0.4); ax.legend()
-
-        # (4,0) LLM agreement rate + valid vote rate
-        ax = axes[4, 0]
         if agreement_rates:
             ax.plot(np.arange(len(agreement_rates)), agreement_rates, lw=1.5, color='green', label='LLM Agree')
         if valid_vote_rates:
@@ -1272,8 +1169,8 @@ def train_card_hesitation(
         ax.set_title('LLM Agreement & Valid Vote Rate'); ax.set_ylim(-0.05, 1.05)
         ax.grid(True, ls='--', alpha=0.4); ax.legend()
 
-        # (4,1) Score distribution
-        ax = axes[4, 1]
+        # (4,0) Score distribution
+        ax = axes[4, 0]
         if len(ep_actual_scores) > 500:
             ax.hist(ep_actual_scores[:500], bins=30, alpha=0.5, color='blue', label='First 500', density=True)
             ax.hist(ep_actual_scores[-500:], bins=30, alpha=0.5, color='red', label='Last 500', density=True)
@@ -1282,22 +1179,39 @@ def train_card_hesitation(
         ax.set_xlabel('Score'); ax.set_ylabel('Density')
         ax.set_title('Score Distribution'); ax.grid(True, ls='--', alpha=0.4); ax.legend()
 
+        # (4,1) empty or summary text
+        ax = axes[4, 1]
+        ax.axis('off')
+        if len(ep_actual_scores) > 0:
+            final_100 = float(np.mean(ep_actual_scores[-100:])) if len(ep_actual_scores) >= 100 else float(np.mean(ep_actual_scores))
+            summary = (
+                f"Action space: Categorical({NUM_ACTIONS})\n"
+                f"Final avg score (last 100): {final_100:.0f}\n"
+                f"Max score: {max(ep_actual_scores):.0f}\n"
+                f"Final alpha: {agent.alpha:.4f}\n"
+                f"LLM queries: {llm_prior.total_queries if llm_prior else 0}\n"
+                f"Cache hits: {llm_prior.cache_hits if llm_prior else 0}"
+            )
+            ax.text(0.1, 0.5, summary, transform=ax.transAxes, fontsize=12,
+                    verticalalignment='center', family='monospace')
+
         plt.tight_layout()
         plot_path = f"{output_dir}/plots/{run_name}_curve.png"
         plt.savefig(plot_path, dpi=160)
         if 'google.colab' in sys.modules:
             plt.show()
         plt.close('all')
-        print(f"[Plot] Saved → {plot_path}")
+        print(f"[Plot] Saved -> {plot_path}")
 
     # ── Print summary ────────────────────────────────────────
     if len(ep_actual_scores) > 0:
         final_100 = float(np.mean(ep_actual_scores[-100:])) if len(ep_actual_scores) >= 100 \
             else float(np.mean(ep_actual_scores))
         print(f"\n{'='*60}")
+        print(f"  Action space:                  Categorical({NUM_ACTIONS})")
         print(f"  Final avg score (last 100 ep): {final_100:.0f}")
         print(f"  Max score:                     {max(ep_actual_scores):.0f}")
-        print(f"  Final α:                       {agent.alpha:.4f} (init={alpha})")
+        print(f"  Final alpha:                   {agent.alpha:.4f} (init={alpha})")
         if llm_prior:
             print(f"  Total LLM queries:             {llm_prior.total_queries}")
             print(f"  Cache hits:                    {llm_prior.cache_hits}")
@@ -1312,7 +1226,7 @@ def train_card_hesitation(
 
 def main():
     p = argparse.ArgumentParser(
-        description='Hesitation-Gated LLM Prior for Card Play/Discard PPO',
+        description='Hesitation-Gated LLM Prior for Card Play/Discard PPO (Categorical 436)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -1358,14 +1272,14 @@ Examples:
 
     # LLM (本地 vLLM)
     p.add_argument("--llm_model", type=str, default="",
-                   help="HuggingFace model name (不传则纯 PPO)")
+                   help="HuggingFace model name (empty = pure PPO)")
     p.add_argument("--num_votes", type=int, default=5,
                    help="N: LLM queries per state for voting")
     p.add_argument("--llm_temperature", type=float, default=0.7)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85,
                    help="vLLM GPU memory fraction (A100-80GB: 0.85 for Qwen3-32B)")
     p.add_argument("--quantization", type=str, default="",
-                   help="Quantization method: awq, gptq, etc. (空=FP16)")
+                   help="Quantization method: awq, gptq, etc. (empty=FP16)")
 
     # Resume
     p.add_argument("--resume_checkpoint", type=str, default="",
@@ -1373,7 +1287,7 @@ Examples:
 
     # Output directory
     p.add_argument("--output_dir", type=str, default="outputs/card_hesitation",
-                   help="Output directory for checkpoints/logs/plots (可指向 Drive 路径)")
+                   help="Output directory for checkpoints/logs/plots")
 
     args = p.parse_args()
 

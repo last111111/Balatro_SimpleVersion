@@ -65,20 +65,18 @@ class JointEnv:
         held_joker_ids = [j for j in self.joker_env.held]
         card_obs = self.card_env.reset_with_jokers(held_joker_ids)
 
-        card_traj = {"obs": [], "a_type": [], "a_mask": [],
-                     "logp_type": [], "logp_mask": [],
+        card_traj = {"obs": [], "combo_idx": [],
+                     "logp": [],
                      "val": [], "rew": [], "done": []}
 
         done = False
         while not done:
-            a_type, a_mask, logp_type, logp_mask, val, _ = card_agent.act(card_obs)
+            a_type, a_mask, combo_idx, logp, val, _ = card_agent.act(card_obs)
             next_obs, reward, done, info = self.card_env.step((a_type, a_mask))
 
             card_traj["obs"].append(card_obs)
-            card_traj["a_type"].append(a_type)
-            card_traj["a_mask"].append(a_mask)
-            card_traj["logp_type"].append(logp_type)
-            card_traj["logp_mask"].append(logp_mask)
+            card_traj["combo_idx"].append(combo_idx)
+            card_traj["logp"].append(logp)
             card_traj["val"].append(val)
             card_traj["rew"].append(reward)
             card_traj["done"].append(done)
