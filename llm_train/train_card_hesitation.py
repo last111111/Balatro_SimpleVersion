@@ -341,8 +341,8 @@ class CardLLMActionPrior:
         prompt = self._build_prompt(env)
         hand = env.hand
 
-        # Hand card 52-dim indices (ordered by position)
-        hand_indices_52 = [_card_index(r, s) for r, s in hand]
+        # Hand card 52-dim indices — MUST be sorted to match act()'s _get_hand_indices()
+        hand_indices_52 = sorted([_card_index(r, s) for r, s in hand])
 
         combo_counts = np.zeros(NUM_ACTIONS, dtype=np.float32)
         valid_votes = 0
