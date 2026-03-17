@@ -1091,8 +1091,7 @@ def train_card_hesitation(
                             llm_prior.total_queries if llm_prior else 0,
                             llm_prior.cache_hits if llm_prior else 0,
                         ])
-                        if len(ep_returns_train) % (log_interval * 10) == 0:
-                            csv_file.flush()  # flush every 1000 episodes to reduce Drive I/O
+                        csv_file.flush()
 
                     ep_ret_train = 0.0
                     ep_ret_plot = 0.0
