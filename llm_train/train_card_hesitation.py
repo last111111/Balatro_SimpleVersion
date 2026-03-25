@@ -484,13 +484,14 @@ class HesitationCardPPOAgent:
                  # Hesitation
                  tau=0.5, alpha=0.1,
                  kl_target=0.5, alpha_min=0.01, alpha_max=10.0,
-                 llm_prior=None):
+                 llm_prior=None, override_prob=1.0):
         self.device = device
         self.gamma, self.lmbda = gamma, gae_lambda
         self.clip, self.vcoef, self.ecoef = clip, vcoef, ecoef
         self.epochs, self.mb_size = epochs, mb_size
         self.max_hand_size = max_hand_size
         self.alpha = alpha
+        self.override_prob = float(np.clip(override_prob, 0.0, 1.0))
 
         # Adaptive alpha
         self.kl_target = kl_target
@@ -571,12 +572,12 @@ class HesitationCardPPOAgent:
             self.gate_stats["active"] += 1
             p_llm_combo = self.llm_prior.get_prior(env)
 
-            # LLM action override: use LLM's most-voted combo
-            if p_llm_combo is not None:
+            # Optional hard override: use LLM's most-voted combo.
+            if p_llm_combo is not None and self.override_prob > 0.0:
                 # Find best valid combo from LLM prior
                 llm_probs_t = torch.as_tensor(p_llm_combo, dtype=torch.float32, device=self.device)
                 llm_probs_t[~valid_mask[0]] = 0.0
-                if llm_probs_t.sum() > 0:
+                if llm_probs_t.sum() > 0 and np.random.random() < self.override_prob:
                     llm_combo_idx = int(llm_probs_t.argmax().item())
                     combo_idx = llm_combo_idx
                     combo_idx_t = torch.tensor(combo_idx, device=self.device)
@@ -790,6 +791,7 @@ def train_card_hesitation(
     kl_target=0.5,
     alpha_min=0.01,
     alpha_max=10.0,
+    override_prob=1.0,
     # LLM (本地 vLLM)
     llm_model="",
     num_votes=5,
@@ -832,7 +834,8 @@ def train_card_hesitation(
             llm_log_path=llm_log_path,
             quantization=quantization if quantization else None,
         )
-        print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, tau={tau}, alpha={alpha}")
+        mode = "KL-only" if override_prob <= 0.0 else f"override_prob={override_prob:.2f}"
+        print(f"[Init] LLM prior: {llm_model} (local vLLM), N={num_votes}, tau={tau}, alpha={alpha}, {mode}")
     else:
         print(f"[Init] No LLM -- pure PPO mode (tau={tau}, alpha={alpha} ignored)")
 
@@ -854,7 +857,7 @@ def train_card_hesitation(
         total_updates=total_updates,
         tau=tau, alpha=alpha,
         kl_target=kl_target, alpha_min=alpha_min, alpha_max=alpha_max,
-        llm_prior=llm_prior,
+        llm_prior=llm_prior, override_prob=override_prob,
     )
 
     # ── Resume from checkpoint ─────────────────────────────────
@@ -1009,6 +1012,7 @@ def train_card_hesitation(
                             "obs_dim": obs_dim, "max_hand_size": max_hand_size,
                             "max_play": max_play, "tau": tau, "alpha": agent.alpha,
                             "shaping_beta": shaping_beta, "discard_cost": discard_cost,
+                            "override_prob": agent.override_prob,
                             "action_space": "categorical_436",
                         },
                     }, ckpt_path)
@@ -1062,6 +1066,7 @@ def train_card_hesitation(
             "obs_dim": obs_dim, "max_hand_size": max_hand_size,
             "max_play": max_play, "tau": tau, "alpha": agent.alpha,
             "shaping_beta": shaping_beta, "discard_cost": discard_cost,
+            "override_prob": agent.override_prob,
             "action_space": "categorical_436",
         },
     }, final_path)
@@ -1267,6 +1272,8 @@ Examples:
                    help="Target KL for adaptive alpha")
     p.add_argument("--alpha_min", type=float, default=0.01)
     p.add_argument("--alpha_max", type=float, default=10.0)
+    p.add_argument("--override_prob", type=float, default=1.0,
+                   help="Probability of hard-overriding PPO action with LLM argmax on gated states")
 
     # LLM (本地 vLLM)
     p.add_argument("--llm_model", type=str, default="",
@@ -1314,6 +1321,7 @@ Examples:
         kl_target=args.kl_target,
         alpha_min=args.alpha_min,
         alpha_max=args.alpha_max,
+        override_prob=args.override_prob,
         llm_model=args.llm_model,
         num_votes=args.num_votes,
         llm_temperature=args.llm_temperature,
