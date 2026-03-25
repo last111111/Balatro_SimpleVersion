@@ -432,40 +432,31 @@ class CardLLMActionPrior:
 
 class HesitationGate:
     """
-    Softmax variance gate for Categorical(436) action space.
+    Top-k probability gate for Categorical(436) action space.
 
-    h(s) = 1 - Var(softmax(logits)) * num_valid_actions
-    h near 0 -> uniform (uncertain) -> gate ON
-    h near 1 -> peaked (decisive) -> gate OFF
+    h(s) = sum of top-k probabilities from π(·|s)
+    h near 0 -> uniform (uncertain) -> gate ON (ask LLM)
+    h near 1 -> peaked (decisive) -> gate OFF (trust PPO)
 
-    Actually we use normalized entropy:
-    h(s) = 1 - H(pi) / log(num_valid)
-    h=0 -> max entropy (uniform) -> uncertain -> gate ON
-    h=1 -> zero entropy (deterministic) -> certain -> gate OFF
+    Dimension-agnostic: works the same regardless of action space size.
     """
-    def __init__(self, tau=0.3):
+    def __init__(self, tau=0.5, top_k=5):
         self.tau = tau
+        self.top_k = top_k
 
     def compute_h(self, action_logits, valid_mask):
         """
         action_logits: (B, 436)
         valid_mask:    (B, 436) bool
 
-        Returns h: (B,) in [0, 1]
+        Returns h: (B,) in [0, 1] — sum of top-k probabilities
         """
-        # Mask invalid to -inf
         masked_logits = action_logits.clone()
         masked_logits[~valid_mask] = -1e8
 
-        # Compute entropy of the categorical distribution
-        log_probs = F.log_softmax(masked_logits, dim=-1)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum(dim=-1)  # (B,)
-
-        # Normalize by log(num_valid)
-        num_valid = valid_mask.float().sum(dim=-1).clamp(min=2.0)  # (B,)
-        max_entropy = torch.log(num_valid)
-        h = 1.0 - entropy / max_entropy.clamp(min=1e-8)
+        probs = F.softmax(masked_logits, dim=-1)
+        top_k_probs, _ = probs.topk(self.top_k, dim=-1)  # (B, k)
+        h = top_k_probs.sum(dim=-1)  # (B,)
         return h.clamp(0.0, 1.0)
 
     def __call__(self, action_logits, valid_mask):
@@ -491,7 +482,7 @@ class HesitationCardPPOAgent:
                  vcoef=0.5, ecoef=0.05, epochs=4, mb_size=1024,
                  total_updates=1,
                  # Hesitation
-                 tau=0.3, alpha=0.1,
+                 tau=0.5, alpha=0.1,
                  kl_target=0.5, alpha_min=0.01, alpha_max=10.0,
                  llm_prior=None):
         self.device = device
@@ -793,7 +784,8 @@ def train_card_hesitation(
     checkpoint_interval=50000,
     log_interval=100,
     # Hesitation gate
-    tau=0.3,
+    tau=0.5,
+    tau_min=0.05,
     alpha=0.1,
     kl_target=0.5,
     alpha_min=0.01,
@@ -971,7 +963,7 @@ def train_card_hesitation(
                         "score5": f"{recent5_plot:.0f}",
                         "pr": f"{recent_pr:.2f}",
                         "gate": f"{gate_rate:.1%}",
-                        "alpha": f"{agent.alpha:.3f}",
+                        "tau": f"{agent.gate.tau:.3f}",
                         "llm": llm_prior.total_queries if llm_prior else 0,
                     })
 
@@ -1030,6 +1022,10 @@ def train_card_hesitation(
             updates_done += 1
             agent.ecoef = anneal_ecoef()
             agent.scheduler.step()
+
+            # Anneal tau: linearly decay from tau → tau_min
+            frac = min(1.0, updates_done / max(1, total_updates))
+            agent.gate.tau = tau + (tau_min - tau) * frac
 
             # Track KL + alpha
             nb = max(1, log_info["n_batches"])
@@ -1261,8 +1257,10 @@ Examples:
     p.add_argument("--log_interval", type=int, default=100)
 
     # Hesitation gate
-    p.add_argument("--tau", type=float, default=0.3,
-                   help="Gate threshold: query LLM when h(s) < tau")
+    p.add_argument("--tau", type=float, default=0.5,
+                   help="Gate threshold: query LLM when top-5 prob sum < tau")
+    p.add_argument("--tau_min", type=float, default=0.05,
+                   help="Final tau after linear decay")
     p.add_argument("--alpha", type=float, default=0.1,
                    help="Initial KL regularization coefficient")
     p.add_argument("--kl_target", type=float, default=0.5,
@@ -1311,6 +1309,7 @@ Examples:
         checkpoint_interval=args.checkpoint_interval,
         log_interval=args.log_interval,
         tau=args.tau,
+        tau_min=args.tau_min,
         alpha=args.alpha,
         kl_target=args.kl_target,
         alpha_min=args.alpha_min,

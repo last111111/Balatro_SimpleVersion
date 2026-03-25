@@ -177,7 +177,8 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
           shaping_beta=0.8,
           discard_cost=-2.0,
           checkpoint_interval=50000,
-          log_interval=100):
+          log_interval=100,
+          resume_checkpoint=None):
 
     set_seed(seed)
     device = get_device()
@@ -208,6 +209,14 @@ def train(total_steps=200_000, update_steps=4096, seed=0, lr=3e-4,
     agent = PPOAgent(obs_dim, max_hand_size, device, lr, gamma, gae_lambda, clip,
                      vcoef, ecoef_start, epochs, mb_size, total_updates=total_updates)
     updates_done = 0
+
+    if resume_checkpoint and os.path.isfile(resume_checkpoint):
+        pkg = torch.load(resume_checkpoint, map_location=device)
+        agent.net.load_state_dict(pkg["state_dict"])
+        if "optimizer" in pkg:
+            agent.opt.load_state_dict(pkg["optimizer"])
+        print(f"[Resume] Loaded checkpoint from {resume_checkpoint}")
+        print(f"[Resume] Previous step={pkg.get('step', '?')}, episode={pkg.get('episode', '?')}")
 
     def anneal_ecoef():
         frac = min(1.0, updates_done / max(1, total_updates))
@@ -465,6 +474,7 @@ def main():
     p.add_argument("--discard_cost", type=float, default=-2.0)
     p.add_argument("--checkpoint_interval", type=int, default=50000)
     p.add_argument("--log_interval", type=int, default=100)
+    p.add_argument("--resume_checkpoint", type=str, default=None)
     args = p.parse_args()
 
     train(total_steps=args.total_steps, update_steps=args.update_steps,
@@ -474,7 +484,8 @@ def main():
           epochs=args.epochs, mb_size=args.mb_size,
           max_hand_size=args.max_hand_size, max_play=args.max_play,
           shaping_beta=args.shaping_beta, discard_cost=args.discard_cost,
-          checkpoint_interval=args.checkpoint_interval, log_interval=args.log_interval)
+          checkpoint_interval=args.checkpoint_interval, log_interval=args.log_interval,
+          resume_checkpoint=args.resume_checkpoint)
 
 
 if __name__ == "__main__":
